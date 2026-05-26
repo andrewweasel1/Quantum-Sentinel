@@ -52,20 +52,12 @@ def populate_indicators(df):
         
     return df
 
-def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
-    """
-    Simulates a standard directional trade for every row.
-    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss.
-    Limits execution horizons via max_hold_days to prevent liquidity traps.
-    """
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    atrs = df['atr'].values
-    labels = np.zeros(len(df), dtype=np.int8)
-
-    for i in range(len(df) - max_hold_days):
-        if pd.isna(atrs[i]):
+@njit
+def _compute_rmultiple_labels(closes, highs, lows, atrs, rr_ratio, max_hold_days):
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int8)
+    for i in range(n - max_hold_days):
+        if np.isnan(atrs[i]):
             continue
             
         stop_loss = closes[i] - atrs[i]
@@ -77,11 +69,48 @@ def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
             if highs[j] >= tp:
                 labels[i] = 1
                 break
-                
-    df['target_label'] = labels
+    return labels
+
+def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
+    """
+    Simulates a standard directional trade for every row [2].
+    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss [2].
+    """
+    # Delegates the heavy lifting to the highly optimized C-level compiled function
+    df['target_label'] = _compute_rmultiple_labels(
+        df['close'].values, df['high'].values, df['low'].values, df['atr'].values, 
+        rr_ratio, max_hold_days
+    )
     return df
 
+@njit
+def _compute_options_labels(closes, atrs, dte, target_premium_gain):
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int8)
+    for i in range(n - dte):
+        if np.isnan(atrs[i]):
+            continue
+            
+        entry_price = closes[i]
+        target_price = entry_price + (atrs[i] * 2) 
+        stop_loss = entry_price - atrs[i]
+
+        for j in range(i + 1, i + dte):
+            if closes[j] <= stop_loss:
+                break
+            if closes[j] >= target_price:
+                labels[i] = 1
+                break
+    return labels
+
 def add_options_labels(df, dte=21, target_premium_gain=0.50):
+    """
+    Simulates a Delta-adjusted option contract return [3].
+    """
+    df['option_target_label'] = _compute_options_labels(
+        df['close'].values, df['atr'].values, dte, target_premium_gain
+    )
+    return df
     """
     Simulates a Delta-adjusted option contract return.
     Accounts for time horizons across the specific Days to Expiration (DTE).

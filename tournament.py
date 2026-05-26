@@ -6,21 +6,21 @@ import pandas as pd
 import dask.dataframe as dd
 import xgboost as xgb
 from sklearn.metrics import precision_score
+from typing import Tuple, List, Optional, Any
 import config
 
 class ModularTournamentDirector:
-    def __init__(self):
+    def __init__(self) -> None:
         """
         Initializes the Tournament Director by memory-mapping the compiled feature
         matrices directly from the processed vault using Dask and PyArrow.
         """
         print(f"Mounting out-of-core data from {config.PROCESSED_VAULT_DIR}...")
-        self.ddf = dd.read_parquet(config.PROCESSED_VAULT_DIR, **config.DASK_READ_KKWARGS)
-        self.results = []
-        self.tuning_logs = []
+        self.ddf: dd.DataFrame = dd.read_parquet(config.PROCESSED_VAULT_DIR, **config.DASK_READ_KWARGS)
+        self.results: List[Dict[str, Any]] = []
+        self.tuning_logs: List[Dict[str, Any]] = []
 
-    def apply_purged_embargo_split(self, df, train_fraction=0.8, embargo_window=20):
-        """
+    def apply_purged_embargo_split(self, df: pd.DataFrame, train_fraction: float = 0.8, embargo_window: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:        """
         Executes Purging and Embargoing to prevent data leakage (look-ahead bias).
         - Purging: Drops training observations that overlap with the test set's prediction horizon.
         - Embargoing: Institutes a multi-day blackout period cleanly separating train/test sets.
@@ -37,10 +37,13 @@ class ModularTournamentDirector:
         
         return train_df, test_df
 
-    def tune_sector_grid(self, sector_name):
-        """
+    def tune_sector_grid(self, sector_name: str) -> Optional[Tuple[xgb.Booster, List[str], float]]:        """
         Filters the out-of-core data for a specific sector, caches it dynamically to the GPU 
         using QuantileDMatrix, and performs a rigorous hyperparameter grid search.
+        """
+        """
+        Returns an Optional Tuple. If the sector fails (e.g., lacks data), it safely returns None.
+        Otherwise, it returns the XGBoost model, the feature manifest list, and the precision float.
         """
         print(f"\n--- Initiating Grid Search Tournament for Sector: {sector_name} ---")
         

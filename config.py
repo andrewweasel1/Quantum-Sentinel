@@ -2,6 +2,37 @@ import os
 from datetime import datetime, timedelta
 import pyarrow as pa
 import pandas as pd
+import argparse
+import logging
+import config
+
+# ==============================================================================
+# 0. CENTRALIZED LOGGING CONFIGURATION
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
+        logging.StreamHandler()                       # Prints to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import custom modules AFTER logging is configured
+import data_ingestion
+import feature_compiler
+import tournament
+
+def main():
+    logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
+    
+    # ... [rest of the arg parsing logic remains the same]
+
+    # Replace print statements with logger.info
+    if args.refresh_raw:
+        logger.info("[COMMAND] --refresh-raw detected. Synchronizing raw market data...")
+        # ...
 
 # ==============================================================================
 # 1. GLOBAL SYSTEM RUN MODE CONFIGURATION
@@ -19,7 +50,7 @@ END_DATE = datetime.now().strftime('%Y-%m-%d')
 RAW_VAULT_DIR = "./market_vault_raw"
 PROCESSED_VAULT_DIR = f"./market_vault_processed_{RUN_MODE.lower()}"
 RESULTS_FILE = "tournament_final_results.parquet"
-LIVE_LOG_FILE = "live_execution_log.parquet"
+LIVE_LOG_DIR = "./live_execution_ledger"
 PROD_MODELS_DIR = "./production_models"
 
 # ==============================================================================
@@ -83,3 +114,8 @@ NULLABLE_TYPES_MAPPER = {
     pa.float64(): pd.Float64Dtype(),
     pa.string(): pd.StringDtype()
 }
+
+# Add this to the bottom of config.py
+LOG_DIR = "./system_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+SYSTEM_LOG_FILE = os.path.join(LOG_DIR, "quantum_sentinel.log")

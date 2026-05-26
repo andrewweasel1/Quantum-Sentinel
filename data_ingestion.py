@@ -3,7 +3,12 @@ import shutil
 import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import config
+from typing import Dict
+
+# Initialize the logger for this specific module
+logger = logging.getLogger(__name__)
 
 def raw_vault_is_populated():
     """Checks if the raw vault directory exists and contains partitioned data."""
@@ -17,7 +22,7 @@ def reset_raw_vault():
         shutil.rmtree(config.RAW_VAULT_DIR)
     os.makedirs(config.RAW_VAULT_DIR, exist_ok=True)
 
-def get_survivorship_adjusted_universe():
+def get_survivorship_adjusted_universe() -> Dict[str, str]:
     """
     Retrieves dynamic point-in-time index matrices to eliminate survivorship bias, 
     injecting historically active and failed/delisted corporate tickers.
@@ -32,11 +37,10 @@ def get_survivorship_adjusted_universe():
         print(f"Error mapping sectors: {e}")
         return {}
 
-def ingest_raw_ticker(ticker, sector):
+def ingest_raw_ticker(ticker, sector) -> bool:
+    def ingest_raw_ticker(ticker, sector):
     """Thread-safe isolated extraction processing loop for a single ticker."""
     try:
-        # Explicitly disable multi-level indexes to keep the dataframe columns flat.
-        # This prevents silent failures during downstream technical analysis.
         df = yf.download(
             ticker, 
             start=config.START_DATE, 
@@ -46,27 +50,26 @@ def ingest_raw_ticker(ticker, sector):
             multi_level_index=False
         )
         
-        # Skip if data is empty or lacks sufficient history for indicator lookbacks (e.g., 252 trading days)
         if df.empty or len(df) < 252:
             return False
             
-        # Append metadata columns
         df['ticker'] = ticker
         df['sector'] = sector
         
-        # Hive partitioning save format: sector=Technology/AAPL.parquet
         out_dir = os.path.join(config.RAW_VAULT_DIR, f"sector={sector}")
         os.makedirs(out_dir, exist_ok=True)
         
-        # Save directly to PyArrow parquet
         df.to_parquet(os.path.join(out_dir, f"{ticker}.parquet"), engine='pyarrow')
         return True
+        
     except Exception as e:
+        # CRITICAL FIX: Logs the exact line and reason for the failure
+        logger.error(f"Ingestion failed for {ticker} in sector {sector}.", exc_info=True)
         return False
 
-def build_raw_vault(universe_map):
+def build_raw_vault(universe_map: Dict[str, str]) -> None:
     """Asynchronous pipeline leveraging host thread scaling to populate the local vault."""
-    print("Executing point-in-time survivorship-adjusted raw data acquisition layer...")
+    logger.info("Executing point-in-time survivorship-adjusted raw data acquisition layer...")
     reset_raw_vault()
     
     # Throttled max_workers to mitigate IP rate-limiting dropouts on public APIs like Yahoo Finance

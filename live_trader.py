@@ -2,14 +2,22 @@ import os
 import json
 import xgboost as xgb
 import pandas as pd
+import pandas_ta as ta
 import numpy as np
 import config
+import logging
 import math
+import pyarrow as pa
+import pyarrow.parquet as pq
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from numba import njit
+from typing import Dict, Any, List
 
-def discover_production_pool():
+logger = logging.getLogger(__name__)
+
+def discover_production_pool() -> Dict[str, Dict[str, Any]]:
     """
     Scans the production folder and groups models with their exact feature manifests.
     This creates the multi-model sandbox where old champions and new challengers coexist.
@@ -41,86 +49,93 @@ def discover_production_pool():
                 "features": features
             }
             
-    print(f"Active pool: Discovered {len(models_pool)} production models running concurrently.")
+    logger.info("Active pool: Discovered {len(models_pool)} production models running concurrently.")
     return models_pool
 
-def run_live_sandbox_cycle(live_market_df):
+def run_live_sandbox_cycle(live_market_df: pd.DataFrame) -> None:
     """
     Evaluates live market streams across all commissioned models simultaneously.
     Logs independent decisions to a unified live ledger for the dashboard.
     """
     pool = discover_production_pool()
     if not pool:
-        print("Sandbox pool is empty. Deploy models from the tournament using exporter.py first.")
+        logger.warning("Sandbox pool is empty. Deploy the tournament using exporter.py first.")odels fro
         return
 
     new_log_entries = []
     timestamp = pd.Timestamp.now()
+    
+    # Extract strings/metadata safely as numpy arrays for fast iteration later
+    tickers = live_market_df.get('ticker', pd.Series(['UNKNOWN'] * len(live_market_df))).values
+    sentiments = live_market_df.get('llm_sentiment', pd.Series([np.nan] * len(live_market_df))).values
 
     # Process live data through every model in the sandbox pool
     for model_id, components in pool.items():
         bst = components["booster"]
         expected_features = components["features"]
         
-        for index, row in live_market_df.iterrows():
-            ticker = row.get('ticker', 'UNKNOWN')
+        # 1. BATCH FEATURE ALIGNMENT (Eliminating iterrows bottleneck)
+        # We build a single dictionary mapping for the entire incoming batch.
+        aligned_data = {}
+        for f in expected_features:
+            if f in live_market_df.columns:
+                aligned_data[f] = live_market_df[f].values
+            else:
+                aligned_data[f] = np.full(len(live_market_df), np.nan)
             
-            # 1. Strict Feature Alignment (Pipeline Locking)
-            # This protects the system from runtime crashes if you added or removed
-            # indicators in your development environment (indicators.py). It forces the 
-            # live data to conform strictly to what the frozen model expects.
-            aligned_data = {}
-            for f in expected_features:
-                aligned_data[f] = [row.get(f, np.nan)]
-                
-            dmatrix = xgb.DMatrix(pd.DataFrame(aligned_data))
-            
-            # 2. GPU Inference
-            prediction_prob = bst.predict(dmatrix)
-            
-            # 3. Simulate Decision & Risk Manager Gate
+        aligned_df = pd.DataFrame(aligned_data)
+        
+        # 2. BATCH GPU INFERENCE (Eliminating per-row DMatrix creation)
+        dmatrix = xgb.DMatrix(aligned_df)
+        predictions = bst.predict(dmatrix)
+        
+        # 3. FAST ARRAY ITERATION 
+        # Iterating through the resulting 1D numpy array of probabilities is exponentially faster 
+        # than looping through the original Pandas dataframe.
+        for idx, prediction_prob in enumerate(predictions):
+            ticker = tickers[idx]
             status = "HELD"
             reason = "Confidence Below Threshold"
             signal = 0
             
-            # Utilizing the > 65% mathematically profitable confidence threshold
             if prediction_prob > 0.65:
                 status = "EXECUTED (PAPER)"
                 reason = "Passed All Gates"
                 signal = 1
                 
-                # --- LIVE CAPITAL ROUTING (The Risk Manager Gate) ---
-                # Only execute authentic Alpaca API trades if the signal comes from
-                # your explicitly vetted flagship model. All others remain in shadow mode.
+                # --- LIVE CAPITAL ROUTING GATE ---
                 # if model_id == "standard_technology_champion_v1" and signal == 1:
-                #     execute_live_capital_order(ticker)
-
-            # 4. Build Telemetry Log
+                #     execute_live_capital_order(ticker, entry_price, stop_loss)
+                
             new_log_entries.append({
                 "Timestamp": timestamp,
                 "Model_ID": model_id,
                 "Ticker": ticker,
-                "ML_Confidence": prediction_prob,
-                "LLM_Sentiment": row.get('llm_sentiment', np.nan),
+                "ML_Confidence": float(prediction_prob),
+                "LLM_Sentiment": sentiments[idx],
                 "Status": status,
                 "Veto_Reason": reason,
-                "P/L": 0.0  # To be updated retroactively upon trade closure
+                "P/L": 0.0 
             })
 
-    # 5. Append to the Unified Live Ledger
+    # 4. Append to the Unified Live Ledger
     if new_log_entries:
         new_df = pd.DataFrame(new_log_entries)
         
-        if os.path.exists(config.LIVE_LOG_FILE):
-            existing_df = pd.read_parquet(config.LIVE_LOG_FILE)
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        else:
-            combined_df = new_df
-            
-        combined_df.to_parquet(config.LIVE_LOG_FILE, engine='pyarrow')
-        print(f"Sandbox Cycle Complete. {len(new_log_entries)} telemetry lines appended to the ledger.")
+        # Convert the Pandas DataFrame directly into a PyArrow Table
+        table = pa.Table.from_pandas(new_df)
+        
+        # Write directly to a partitioned dataset directory.
+        # This completely bypasses reading old data. It safely drops new 
+        # parquet files into folders separated by their Model_ID.
+        pq.write_to_dataset(
+            table,
+            root_path=config.LIVE_LOG_DIR,
+            partition_cols=['Model_ID']
+        )
+        logger.info("Sandbox Cycle Complete. {len(new_log_entries)} telemetry lines safely appended to the dataset.")
 
-def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_paper=True):
+def execute_live_capital_order(ticker: str, entry_price: float, stop_loss: float, side: str = "BUY", is_paper: bool = True) -> bool:
     """
     Routes authentic orders to the Alpaca Trading API.
     Toggles between Paper Trading and Live Capital based on the `is_paper` flag.
@@ -133,7 +148,7 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
     secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
     
     if not api_key or not secret_key:
-        print("Error: Alpaca API credentials not found in environment variables.")
+        logger.error("Error: Alpaca API credentials not found in environment variables.")
         return False
 
     # 2. Initialize the Trading Client
@@ -151,14 +166,14 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
         risk_per_share = abs(entry_price - stop_loss)
         
         if risk_per_share <= 0:
-            print("Error: Invalid stop-loss parameters. Trade aborted.")
+            logger.error("Error: Invalid stop-loss parameters. Trade aborted.")
             return False
             
         # Calculate exactly how many shares we can buy without violating the 2% rule
         target_qty = math.floor(risk_allowance / risk_per_share)
         
         if target_qty <= 0:
-            print(f"VETOED: Account equity (${account_equity}) insufficient to purchase {ticker} at safe risk thresholds.")
+            logger.warning(f"VETOED: Account equity (${account_equity}) insufficient to purchase {ticker} at safe risk thresholds.")
             return False
 
         # 4. Map the Order Parameters
@@ -173,14 +188,14 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
         
         # 5. Execute the Trade
         env_label = "PAPER SIMULATION" if is_paper else "LIVE CAPITAL"
-        print(f"[{env_label}] Routing {order_side.name} order for {target_qty} shares of {ticker}...")
+        logger.INFO(f"[{env_label}] Routing {order_side.name} order for {target_qty} shares of {ticker}...")
         
         market_order = trading_client.submit_order(order_data=market_order_data)
-        print(f"Execution Successful! Alpaca Order ID: {market_order.id}")
+        logger.info(f"Execution Successful! Alpaca Order ID: {market_order.id}")
         
         return True
 
     except Exception as e:
-        print(f"Order execution rejected by Alpaca: {e}")
+        logger.error(f"Order execution rejected by Alpaca: {e}")
         # Note: HTTP 401 errors generally mean you passed a Live API key while 'paper=True'
         return False

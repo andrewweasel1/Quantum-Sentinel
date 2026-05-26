@@ -1,0 +1,40 @@
+# Python environment
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Quantum Sentinel Data Vaults (Large Parquet Files)
+market_vault_raw/
+market_vault_processed_standard/
+market_vault_processed_options/
+
+# Models & Manifests
+production_models/
+*_candidate.json
+*_champion.json
+*_features.json
+
+# Live Execution & Telemetry Logs
+live_execution_ledger/
+system_logs/
+quantum_sentinel.log
+
+# Evaluation Outputs
+tournament_final_results.parquet
+grid_search_raw_logs.parquet
+returns_matrix_*.parquet
+benchmark_*.parquet
+tearsheet_*.html
+champion_tearsheet.html
+
+# OS generated files
+.DS_Store
+Thumbs.db

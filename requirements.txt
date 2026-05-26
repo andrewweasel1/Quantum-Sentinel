@@ -1,0 +1,29 @@
+# Core Data & Performance
+pandas
+numpy
+scipy
+dask[dataframe]
+pyarrow>=10.0.0
+numba
+
+# Machine Learning & Indicators
+xgboost
+pandas_ta
+scikit-learn
+
+# Institutional Quantitative Metrics
+jsharpe
+pypbo
+quantstats
+statsmodels
+joblib
+seaborn
+
+# Execution & Telemetry
+alpaca-py
+yfinance
+requests
+
+# Dashboard & Visualization
+streamlit
+plotly

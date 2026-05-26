@@ -1,93 +1,33 @@
-# Quantum-Sentinel
+# 🛡️ Quantum Sentinel V4
 
-**A Quantitative Trading Machine Learning Pipeline**
+Quantum Sentinel is an institutional-grade, multi-agent quantitative trading architecture. It is designed to rigorously backtest, evaluate, and execute machine learning-based trading strategies while actively mitigating common quantitative pitfalls such as survivorship bias, look-ahead bias, and multiple testing bias.
 
-## Overview
+## 🏗️ Architecture Overview
 
-Quantum-Sentinel is an advanced machine learning pipeline designed for quantitative trading applications. This project combines sophisticated data processing, feature engineering, and machine learning models to analyze market data and generate trading signals.
+The system is decoupled into isolated layers for data acquisition, out-of-core feature compilation, statistical evaluation, and live execution.
 
-## Features
+*   **`config.py`**: Centralized state manager for all operational modes, hyperparameters, and PyArrow schema definitions.
+*   **`data_ingestion.py`**: Uses Point-in-Time (PiT) data queries (via EODHD) to construct a survivorship-bias-free historical universe. 
+*   **`feature_compiler.py`**: Leverages Numba JIT-compilation and Dask out-of-core memory mapping to generate market microstructure sensors (e.g., Amihud Illiquidity, Roll's Spread) and Tail-Risk metrics. It utilizes a Friction-Adjusted Triple Barrier Method for label generation.
+*   **`tournament.py`**: Runs a massive hyperparameter grid search across XGBoost models using Combinatorial Purged Cross-Validation (CPCV) to prevent data leakage and generates multi-path returns matrices.
+*   **`evaluator.py`**: The statistical gatekeeper. Evaluates candidate models by computing the Probability of Backtest Overfitting (PBO), controls for the False Discovery Rate (FDR) using the Deflated Sharpe Ratio (DSR), and generates HTML tearsheets.
+*   **`live_trader.py`**: An asynchronous execution sandbox that routes signals from the champion models directly to the Alpaca Trading API, managing dynamic position sizing and logging to a partitioned PyArrow ledger.
+*   **`dashboard.py`**: An interactive Streamlit application for monitoring active models, live telemetry, and reviewing quantitative tearsheets.
 
-- **Data Pipeline**: Robust data ingestion and preprocessing for market data
-- **Feature Engineering**: Advanced feature extraction for technical and fundamental analysis
-- **Machine Learning Models**: Multiple ML algorithms for price prediction and signal generation
-- **Backtesting Framework**: Comprehensive backtesting capabilities to validate trading strategies
-- **Risk Management**: Built-in risk assessment and portfolio optimization tools
-- **Real-time Analysis**: Support for real-time market data processing
+## 🚀 Quick Start
 
-## Getting Started
-
-### Prerequisites
-
-- Python 3.8+
-- [List other dependencies as discovered]
-
-### Installation
-
+**1. Set Environment Variables**
+Ensure you have the necessary API keys exported in your environment:
 ```bash
-git clone https://github.com/andrewweasel1/Quantum-Sentinel.git
-cd Quantum-Sentinel
+export EODHD_API_KEY="your_api_key"
+export ALPACA_PAPER_API_KEY="your_paper_key"
+export ALPACA_PAPER_SECRET_KEY="your_paper_secret"
+# Add Live Alpaca keys if trading with live capital
+2. Install Dependencies
 pip install -r requirements.txt
-```
-
-### Quick Start
-
-```python
-# Example usage
-from quantum_sentinel import TradingPipeline
-
-pipeline = TradingPipeline()
-# Configure and run your analysis
-```
-
-## Project Structure
-
-```
-Quantum-Sentinel/
-├── data/                 # Data storage and datasets
-├── src/                  # Source code
-│   ├── preprocessing/    # Data preprocessing
-│   ├── features/         # Feature engineering
-│   ├── models/           # ML models
-│   └── backtesting/      # Backtesting framework
-├── tests/                # Unit tests
-├── notebooks/            # Jupyter notebooks for exploration
-├── requirements.txt      # Python dependencies
-└── README.md            # This file
-```
-
-## Usage
-
-[Add detailed usage instructions and examples]
-
-## Model Training
-
-[Add information about training the ML models]
-
-## Backtesting
-
-[Add backtesting instructions and examples]
-
-## Performance
-
-[Add performance metrics and results]
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-[Specify your license here]
-
-## Contact
-
-For questions or feedback, please reach out to [@andrewweasel1](https://github.com/andrewweasel1)
-
-## Disclaimer
-
-This project is for educational and research purposes only. Trading in financial markets involves substantial risk of loss. Always conduct thorough research and consider consulting with financial advisors before implementing any trading strategies.
-
----
-
-**Last Updated**: May 2026
+3. Run the Pipeline Execute the main orchestrator to download raw data, compile offline feature matrices, and initiate the out-of-core XGBoost tournament:
+python main.py --refresh-raw
+4. Evaluate Champions Once the tournament generates the CPCV returns matrices, run the evaluator to mathematically prove the alpha and promote candidates to production champions:
+python evaluator.py
+5. Launch the Dashboard Monitor your live execution ledger and view institutional tearsheets:
+streamlit run dashboard.py

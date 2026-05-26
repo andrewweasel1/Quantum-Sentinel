@@ -13,9 +13,8 @@ scikit-learn
 
 # Institutional Quantitative Metrics
 jsharpe
-pypbo
 quantstats
-statsmodels
+statsmodels>=0.13.0
 joblib
 seaborn
 

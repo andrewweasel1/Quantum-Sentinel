@@ -1,5 +1,6 @@
 import os
 import glob
+import itertools
 import logging
 from typing import Optional
 
@@ -7,7 +8,6 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import jsharpe
-import pypbo
 import quantstats as qs
 
 import config
@@ -21,10 +21,10 @@ class QuantitativeEvaluator:
     def __init__(self) -> None:
         """
         Initializes the Evaluation suite. It relies on the Parquet matrices
-        and benchmark files exported by the newly refactored tournament.py.
+        and benchmark files exported by tournament.py.
         """
         self.confidence_level = 0.95
-        self.pbo_splits = 8
+        self.pbo_partitions = 8
 
     def compute_trial_p_values(self, returns_matrix: pd.DataFrame) -> np.ndarray:
         """
@@ -40,10 +40,8 @@ class QuantitativeEvaluator:
 
             # Calculate Probabilistic Sharpe Ratio (PSR) for the trial
             try:
-                # Attempt to use jsharpe native computation
                 psr = jsharpe.probabilistic_sharpe_ratio(returns)
             except Exception:
-                # Fallback to explicit math if the API signature expects moments
                 sr = np.mean(returns) / np.std(returns)
                 skewness = stats.skew(returns)
                 kurt = stats.kurtosis(returns)
@@ -53,10 +51,60 @@ class QuantitativeEvaluator:
                 denom = np.sqrt(1 - skewness * sr + ((kurt - 1) / 4) * sr**2)
                 psr = stats.norm.cdf(stat / denom)
 
-            # p-value is the probability that the true Sharpe Ratio is NOT > 0
             p_values.append(1.0 - float(psr))
             
         return np.array(p_values)
+
+    def calculate_native_pbo(self, returns_matrix: pd.DataFrame) -> float:
+        """
+        Natively calculates the Probability of Backtest Overfitting (PBO) by 
+        implementing the Bailey et al. (2015) combinatorial framework.
+        """
+        mat = returns_matrix.values
+        T, N = mat.shape
+        
+        if T < self.pbo_partitions or N < 2:
+            logger.warning("Not enough data or trials to compute PBO meaningfully.")
+            return 0.0
+            
+        # 1. Split timeline into equal, contiguous partitions
+        partitions = np.array_split(mat, self.pbo_partitions, axis=0)
+        partition_indices = list(range(self.pbo_partitions))
+        
+        # 2. Form all Combinatorial In-Sample (IS) and Out-Of-Sample (OOS) paths
+        is_combos = list(itertools.combinations(partition_indices, self.pbo_partitions // 2))
+        
+        logits = []
+        for is_idx in is_combos:
+            oos_idx = [i for i in partition_indices if i not in is_idx]
+            
+            is_mat = np.vstack([partitions[i] for i in is_idx])
+            oos_mat = np.vstack([partitions[i] for i in oos_idx])
+            
+            # 3. Calculate Sharpe Ratios for both sets
+            is_std = np.std(is_mat, axis=0)
+            is_std[is_std == 0] = 1e-8  # Prevent division by zero
+            is_sr = np.mean(is_mat, axis=0) / is_std
+            
+            oos_std = np.std(oos_mat, axis=0)
+            oos_std[oos_std == 0] = 1e-8
+            oos_sr = np.mean(oos_mat, axis=0) / oos_std
+            
+            # 4. Identify Best IS Strategy and find its OOS rank
+            best_is_idx = np.argmax(is_sr)
+            best_is_oos_sr = oos_sr[best_is_idx]
+            
+            # Rank is the fraction of configurations it beat out-of-sample
+            rank = np.sum(oos_sr <= best_is_oos_sr) / N
+            rank = np.clip(rank, 1e-5, 1.0 - 1e-5)
+            
+            # 5. Logit transformation
+            logit = np.log(rank / (1.0 - rank))
+            logits.append(logit)
+            
+        # 6. PBO is the fraction of configurations where OOS performance fell below the median
+        pbo_value = np.sum(np.array(logits) < 0) / len(logits)
+        return float(pbo_value)
 
     def assess_sector(self, sector_name: str) -> bool:
         """
@@ -82,7 +130,6 @@ class QuantitativeEvaluator:
         p_values = self.compute_trial_p_values(returns_matrix)
         passes_fdr = jsharpe.control_for_FDR(p_values, alpha=1.0 - self.confidence_level)
         
-        # We verify if the champion (the trial with the lowest p-value) passes the FDR hurdle
         best_trial_idx = np.argmin(p_values)
         if not passes_fdr[best_trial_idx]:
             logger.warning(f"[{sector_name}] REJECTED: Failed False Discovery Rate (FDR) control.")
@@ -92,8 +139,7 @@ class QuantitativeEvaluator:
         # 2. Probability of Backtest Overfitting (PBO)
         logger.info("2. Evaluating Probability of Backtest Overfitting (PBO)...")
         try:
-            pbo_engine = pypbo.pbo(returns_matrix, S=self.pbo_splits, metric='sharpe')
-            overfit_prob = pbo_engine.pbo_value
+            overfit_prob = self.calculate_native_pbo(returns_matrix)
             logger.info(f"[{sector_name}] PBO: {overfit_prob * 100:.2f}%")
             
             if overfit_prob > 0.50:
@@ -138,7 +184,7 @@ class QuantitativeEvaluator:
         except Exception as e:
             logger.error(f"[{sector_name}] Failed to generate QuantStats tearsheet: {e}")
 
-        # Promote candidate model to champion using os.replace to safely overwrite old champions
+        # Promote candidate model to champion
         candidate_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json")
         champion_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
         
@@ -158,7 +204,6 @@ class QuantitativeEvaluator:
         """
         logger.info("=== COMMENCING POST-TOURNAMENT EVALUATION ===")
         
-        # Dynamically discover all sector files dumped by the tournament
         matrix_files = glob.glob("returns_matrix_*.parquet")
 
         if not matrix_files:
@@ -178,3 +223,9 @@ class QuantitativeEvaluator:
 if __name__ == "__main__":
     evaluator = QuantitativeEvaluator()
     evaluator.run_evaluation_gauntlet()
+Removing the Package
+You can now safely remove pypbo and its limiting statsmodels 0.8.0 requirement from your requirements.txt:
+# Institutional Quantitative Metrics
+jsharpe
+quantstats
+statsmodels>=0.13.0

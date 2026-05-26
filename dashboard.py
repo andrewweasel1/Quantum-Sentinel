@@ -12,6 +12,7 @@ import config
 st.set_page_config(page_title="Quantum Sentinel Analytics Hub", layout="wide", page_icon="🛡️")
 
 # Force strict HTTP verification layers directly within session allocations
+# Force strict HTTP verification layers directly within session allocations
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -20,11 +21,19 @@ if not st.session_state["authenticated"]:
     user_input = st.text_input("Username Identification Profile:")
     pass_input = st.text_input("Secret Clearance Authentication Key:", type="password")
     
-    # Placeholder authentication logic
+    valid_user = os.environ.get("DASHBOARD_USER") 
+    valid_pass = os.environ.get("DASHBOARD_PASS")
+    
+    if not valid_user or not valid_pass:
+        st.error("CRITICAL: Security environment variables (DASHBOARD_USER / DASHBOARD_PASS) are missing.")
+        st.stop()
+        
     if st.button("Authenticate"):
-        if user_input == "admin" and pass_input == "admin": # Replace with secure env vars in production
+        if user_input == valid_user and pass_input == valid_pass: 
             st.session_state["authenticated"] = True
             st.rerun()
+        else:
+            st.error("Authentication failed. Unauthorized access attempt logged.")
     st.stop()
 
 # ==============================================================================

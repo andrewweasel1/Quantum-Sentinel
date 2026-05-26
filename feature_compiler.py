@@ -4,22 +4,31 @@ import dask.dataframe as dd
 import pandas as pd
 import numpy as np
 import pandas_ta as ta
+import logging
+from numba import njit
+from typing import Any
 import config
 
-def processed_vault_is_populated():
+# ==============================================================================
+# 0. CENTRALIZED LOGGING CONFIGURATION
+# ==============================================================================
+# FIXED: Corrected dunder method from **name** to __name__
+logger = logging.getLogger(__name__)
+
+def processed_vault_is_populated() -> bool:
     """Checks if the processed vault directory exists and contains data."""
     if not os.path.exists(config.PROCESSED_VAULT_DIR):
         return False
     subdirs = [d for d in os.listdir(config.PROCESSED_VAULT_DIR) if os.path.isdir(os.path.join(config.PROCESSED_VAULT_DIR, d))]
     return len(subdirs) > 0
 
-def reset_processed_vault():
+def reset_processed_vault() -> None:
     """Clears existing processed data to prevent duplicate or corrupted legacy files."""
     if os.path.exists(config.PROCESSED_VAULT_DIR):
         shutil.rmtree(config.PROCESSED_VAULT_DIR)
     os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
 
-def populate_indicators(df):
+def populate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Populates the mathematical sensor suite using vectorized operations.
     Enforces lower-case column names to protect against key errors downstream.
@@ -35,7 +44,7 @@ def populate_indicators(df):
     # MACD Histogram extraction
     macd = ta.macd(df['close'])
     if macd is not None and not macd.empty:
-        df['macd_hist'] = macd[macd.columns[4]] 
+        df['macd_hist'] = macd[macd.columns[1]] 
     else:
         df['macd_hist'] = np.nan
         
@@ -52,8 +61,12 @@ def populate_indicators(df):
         
     return df
 
+
+# ==============================================================================
+# JIT COMPILED LABEL GENERATION (Eliminates strict Python loop bottlenecks)
+# ==============================================================================
 @njit
-def _compute_rmultiple_labels(closes, highs, lows, atrs, rr_ratio, max_hold_days):
+def _compute_rmultiple_labels(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, atrs: np.ndarray, rr_ratio: float, max_hold_days: int) -> np.ndarray:
     n = len(closes)
     labels = np.zeros(n, dtype=np.int8)
     for i in range(n - max_hold_days):
@@ -71,12 +84,11 @@ def _compute_rmultiple_labels(closes, highs, lows, atrs, rr_ratio, max_hold_days
                 break
     return labels
 
-def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
+def add_rmultiple_labels(df: pd.DataFrame, rr_ratio: float = config.RR_RATIO, max_hold_days: int = config.MAX_HOLD_DAYS) -> pd.DataFrame:
     """
-    Simulates a standard directional trade for every row [2].
-    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss [2].
+    Simulates a standard directional trade for every row.
+    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss.
     """
-    # Delegates the heavy lifting to the highly optimized C-level compiled function
     df['target_label'] = _compute_rmultiple_labels(
         df['close'].values, df['high'].values, df['low'].values, df['atr'].values, 
         rr_ratio, max_hold_days
@@ -84,7 +96,7 @@ def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
     return df
 
 @njit
-def _compute_options_labels(closes, atrs, dte, target_premium_gain):
+def _compute_options_labels(closes: np.ndarray, atrs: np.ndarray, dte: int, target_premium_gain: float) -> np.ndarray:
     n = len(closes)
     labels = np.zeros(n, dtype=np.int8)
     for i in range(n - dte):
@@ -103,41 +115,23 @@ def _compute_options_labels(closes, atrs, dte, target_premium_gain):
                 break
     return labels
 
-def add_options_labels(df, dte=21, target_premium_gain=0.50):
-    """
-    Simulates a Delta-adjusted option contract return [3].
-    """
-    df['option_target_label'] = _compute_options_labels(
-        df['close'].values, df['atr'].values, dte, target_premium_gain
-    )
-    return df
+def add_options_labels(df: pd.DataFrame, dte: int = config.OPTIONS_DTE, target_premium_gain: float = config.TARGET_PREMIUM_GAIN) -> pd.DataFrame:
     """
     Simulates a Delta-adjusted option contract return.
     Accounts for time horizons across the specific Days to Expiration (DTE).
     """
-    closes = df['close'].values
-    atrs = df['atr'].values
-    labels = np.zeros(len(df), dtype=np.int8)
-
-    for i in range(len(df) - dte):
-        if pd.isna(atrs[i]):
-            continue
-            
-        entry_price = closes[i]
-        target_price = entry_price + (atrs[i] * 2) 
-        stop_loss = entry_price - atrs[i]
-
-        for j in range(i + 1, i + dte):
-            if closes[j] <= stop_loss:
-                break
-            if closes[j] >= target_price:
-                labels[i] = 1
-                break
-                
-    df['option_target_label'] = labels
+    # FIXED: Removed the stranded docstring and dead code variables that were 
+    # previously stuck underneath the return statement.
+    df['option_target_label'] = _compute_options_labels(
+        df['close'].values, df['atr'].values, dte, target_premium_gain
+    )
     return df
 
-def compute_partition_features(df):
+
+# ==============================================================================
+# DASK WORKER EXECUTION MAPPING
+# ==============================================================================
+def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Applies massive mechanical sensors to a localized data chunk. 
     Executed lazily inside Dask worker allocation threads.
@@ -157,16 +151,16 @@ def compute_partition_features(df):
     df = df.dropna()
     return df
 
-def compile_features_from_raw():
+def compile_features_from_raw() -> None:
     """
     Orchestrates the offline Dask-powered transformation pipeline.
     Reads partitioned raw data out-of-core, computes math, and flushes to the processed vault.
     """
     if not os.path.exists(config.RAW_VAULT_DIR):
-        print("Error: Raw storage vault missing. Run ingestion sequence first.")
+        logger.error("Raw storage vault missing. Run ingestion sequence first.")
         return
         
-    print("Initiating offline Dask-powered feature compilation...")
+    logger.info("Initiating offline Dask-powered feature compilation...")
     reset_processed_vault()
 
     # Load raw data via PyArrow backed Dask utilizing config settings 
@@ -176,12 +170,10 @@ def compile_features_from_raw():
     ddf_processed = ddf.map_partitions(compute_partition_features)
 
     # Dump the compiled matrices directly into a Hive-partitioned directory scheme
-    # 'write_metadata_file=False' protects background worker nodes from memory 
-    # saturation during final global metadata aggregation on large runs
     ddf_processed.to_parquet(
         config.PROCESSED_VAULT_DIR,
         engine="pyarrow",
         partition_on=['sector'],
         write_metadata_file=False
     )
-    print(f"Feature matrices successfully compiled and safely exported to {config.PROCESSED_VAULT_DIR}.")
+    logger.info(f"Feature matrices successfully compiled and safely exported to {config.PROCESSED_VAULT_DIR}.")

@@ -10,21 +10,21 @@ import pandas as pd
 import dask.dataframe as dd
 import xgboost as xgb
 from sklearn.metrics import precision_score
+from typing import Tuple, List, Optional, Any
 import config
 
 class ModularTournamentDirector:
-    def __init__(self):
+    def __init__(self) -> None:
         """
         Initializes the Tournament Director by memory-mapping the compiled feature
         matrices directly from the processed vault using Dask and PyArrow.
         """
         print(f"Mounting out-of-core data from {config.PROCESSED_VAULT_DIR}...")
-        self.ddf = dd.read_parquet(config.PROCESSED_VAULT_DIR, **config.DASK_READ_KKWARGS)
-        self.results = []
-        self.tuning_logs = []
+        self.ddf: dd.DataFrame = dd.read_parquet(config.PROCESSED_VAULT_DIR, **config.DASK_READ_KWARGS)
+        self.results: List[Dict[str, Any]] = []
+        self.tuning_logs: List[Dict[str, Any]] = []
 
-    def apply_purged_embargo_split(self, df, train_fraction=0.8, embargo_window=20):
-        """
+    def apply_purged_embargo_split(self, df: pd.DataFrame, train_fraction: float = 0.8, embargo_window: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame]:        """
         Executes Purging and Embargoing to prevent data leakage (look-ahead bias).
         - Purging: Drops training observations that overlap with the test set's prediction horizon.
         - Embargoing: Institutes a multi-day blackout period cleanly separating train/test sets.
@@ -41,10 +41,13 @@ class ModularTournamentDirector:
         
         return train_df, test_df
 
-    def tune_sector_grid(self, sector_name):
-        """
+    def tune_sector_grid(self, sector_name: str) -> Optional[Tuple[xgb.Booster, List[str], float]]:        """
         Filters the out-of-core data for a specific sector, caches it dynamically to the GPU 
         using QuantileDMatrix, and performs a rigorous hyperparameter grid search.
+        """
+        """
+        Returns an Optional Tuple. If the sector fails (e.g., lacks data), it safely returns None.
+        Otherwise, it returns the XGBoost model, the feature manifest list, and the precision float.
         """
         print(f"\n--- Initiating Grid Search Tournament for Sector: {sector_name} ---")
         
@@ -251,14 +254,22 @@ import os
 import json
 import xgboost as xgb
 import pandas as pd
+import pandas_ta as ta
 import numpy as np
 import config
+import logging
 import math
+import pyarrow as pa
+import pyarrow.parquet as pq
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from numba import njit
+from typing import Dict, Any, List
 
-def discover_production_pool():
+logger = logging.getLogger(__name__)
+
+def discover_production_pool() -> Dict[str, Dict[str, Any]]:
     """
     Scans the production folder and groups models with their exact feature manifests.
     This creates the multi-model sandbox where old champions and new challengers coexist.
@@ -290,86 +301,93 @@ def discover_production_pool():
                 "features": features
             }
             
-    print(f"Active pool: Discovered {len(models_pool)} production models running concurrently.")
+    logger.info("Active pool: Discovered {len(models_pool)} production models running concurrently.")
     return models_pool
 
-def run_live_sandbox_cycle(live_market_df):
+def run_live_sandbox_cycle(live_market_df: pd.DataFrame) -> None:
     """
     Evaluates live market streams across all commissioned models simultaneously.
     Logs independent decisions to a unified live ledger for the dashboard.
     """
     pool = discover_production_pool()
     if not pool:
-        print("Sandbox pool is empty. Deploy models from the tournament using exporter.py first.")
+        logger.warning("Sandbox pool is empty. Deploy the tournament using exporter.py first.")odels fro
         return
 
     new_log_entries = []
     timestamp = pd.Timestamp.now()
+    
+    # Extract strings/metadata safely as numpy arrays for fast iteration later
+    tickers = live_market_df.get('ticker', pd.Series(['UNKNOWN'] * len(live_market_df))).values
+    sentiments = live_market_df.get('llm_sentiment', pd.Series([np.nan] * len(live_market_df))).values
 
     # Process live data through every model in the sandbox pool
     for model_id, components in pool.items():
         bst = components["booster"]
         expected_features = components["features"]
         
-        for index, row in live_market_df.iterrows():
-            ticker = row.get('ticker', 'UNKNOWN')
+        # 1. BATCH FEATURE ALIGNMENT (Eliminating iterrows bottleneck)
+        # We build a single dictionary mapping for the entire incoming batch.
+        aligned_data = {}
+        for f in expected_features:
+            if f in live_market_df.columns:
+                aligned_data[f] = live_market_df[f].values
+            else:
+                aligned_data[f] = np.full(len(live_market_df), np.nan)
             
-            # 1. Strict Feature Alignment (Pipeline Locking)
-            # This protects the system from runtime crashes if you added or removed
-            # indicators in your development environment (indicators.py). It forces the 
-            # live data to conform strictly to what the frozen model expects.
-            aligned_data = {}
-            for f in expected_features:
-                aligned_data[f] = [row.get(f, np.nan)]
-                
-            dmatrix = xgb.DMatrix(pd.DataFrame(aligned_data))
-            
-            # 2. GPU Inference
-            prediction_prob = bst.predict(dmatrix)
-            
-            # 3. Simulate Decision & Risk Manager Gate
+        aligned_df = pd.DataFrame(aligned_data)
+        
+        # 2. BATCH GPU INFERENCE (Eliminating per-row DMatrix creation)
+        dmatrix = xgb.DMatrix(aligned_df)
+        predictions = bst.predict(dmatrix)
+        
+        # 3. FAST ARRAY ITERATION 
+        # Iterating through the resulting 1D numpy array of probabilities is exponentially faster 
+        # than looping through the original Pandas dataframe.
+        for idx, prediction_prob in enumerate(predictions):
+            ticker = tickers[idx]
             status = "HELD"
             reason = "Confidence Below Threshold"
             signal = 0
             
-            # Utilizing the > 65% mathematically profitable confidence threshold
             if prediction_prob > 0.65:
                 status = "EXECUTED (PAPER)"
                 reason = "Passed All Gates"
                 signal = 1
                 
-                # --- LIVE CAPITAL ROUTING (The Risk Manager Gate) ---
-                # Only execute authentic Alpaca API trades if the signal comes from
-                # your explicitly vetted flagship model. All others remain in shadow mode.
+                # --- LIVE CAPITAL ROUTING GATE ---
                 # if model_id == "standard_technology_champion_v1" and signal == 1:
-                #     execute_live_capital_order(ticker)
-
-            # 4. Build Telemetry Log
+                #     execute_live_capital_order(ticker, entry_price, stop_loss)
+                
             new_log_entries.append({
                 "Timestamp": timestamp,
                 "Model_ID": model_id,
                 "Ticker": ticker,
-                "ML_Confidence": prediction_prob,
-                "LLM_Sentiment": row.get('llm_sentiment', np.nan),
+                "ML_Confidence": float(prediction_prob),
+                "LLM_Sentiment": sentiments[idx],
                 "Status": status,
                 "Veto_Reason": reason,
-                "P/L": 0.0  # To be updated retroactively upon trade closure
+                "P/L": 0.0 
             })
 
-    # 5. Append to the Unified Live Ledger
+    # 4. Append to the Unified Live Ledger
     if new_log_entries:
         new_df = pd.DataFrame(new_log_entries)
         
-        if os.path.exists(config.LIVE_LOG_FILE):
-            existing_df = pd.read_parquet(config.LIVE_LOG_FILE)
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        else:
-            combined_df = new_df
-            
-        combined_df.to_parquet(config.LIVE_LOG_FILE, engine='pyarrow')
-        print(f"Sandbox Cycle Complete. {len(new_log_entries)} telemetry lines appended to the ledger.")
+        # Convert the Pandas DataFrame directly into a PyArrow Table
+        table = pa.Table.from_pandas(new_df)
+        
+        # Write directly to a partitioned dataset directory.
+        # This completely bypasses reading old data. It safely drops new 
+        # parquet files into folders separated by their Model_ID.
+        pq.write_to_dataset(
+            table,
+            root_path=config.LIVE_LOG_DIR,
+            partition_cols=['Model_ID']
+        )
+        logger.info("Sandbox Cycle Complete. {len(new_log_entries)} telemetry lines safely appended to the dataset.")
 
-def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_paper=True):
+def execute_live_capital_order(ticker: str, entry_price: float, stop_loss: float, side: str = "BUY", is_paper: bool = True) -> bool:
     """
     Routes authentic orders to the Alpaca Trading API.
     Toggles between Paper Trading and Live Capital based on the `is_paper` flag.
@@ -382,7 +400,7 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
     secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
     
     if not api_key or not secret_key:
-        print("Error: Alpaca API credentials not found in environment variables.")
+        logger.error("Error: Alpaca API credentials not found in environment variables.")
         return False
 
     # 2. Initialize the Trading Client
@@ -400,14 +418,14 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
         risk_per_share = abs(entry_price - stop_loss)
         
         if risk_per_share <= 0:
-            print("Error: Invalid stop-loss parameters. Trade aborted.")
+            logger.error("Error: Invalid stop-loss parameters. Trade aborted.")
             return False
             
         # Calculate exactly how many shares we can buy without violating the 2% rule
         target_qty = math.floor(risk_allowance / risk_per_share)
         
         if target_qty <= 0:
-            print(f"VETOED: Account equity (${account_equity}) insufficient to purchase {ticker} at safe risk thresholds.")
+            logger.warning(f"VETOED: Account equity (${account_equity}) insufficient to purchase {ticker} at safe risk thresholds.")
             return False
 
         # 4. Map the Order Parameters
@@ -422,15 +440,15 @@ def execute_live_capital_order(ticker, entry_price, stop_loss, side="BUY", is_pa
         
         # 5. Execute the Trade
         env_label = "PAPER SIMULATION" if is_paper else "LIVE CAPITAL"
-        print(f"[{env_label}] Routing {order_side.name} order for {target_qty} shares of {ticker}...")
+        logger.INFO(f"[{env_label}] Routing {order_side.name} order for {target_qty} shares of {ticker}...")
         
         market_order = trading_client.submit_order(order_data=market_order_data)
-        print(f"Execution Successful! Alpaca Order ID: {market_order.id}")
+        logger.info(f"Execution Successful! Alpaca Order ID: {market_order.id}")
         
         return True
 
     except Exception as e:
-        print(f"Order execution rejected by Alpaca: {e}")
+        logger.error(f"Order execution rejected by Alpaca: {e}")
         # Note: HTTP 401 errors generally mean you passed a Live API key while 'paper=True'
         return False
 
@@ -441,7 +459,12 @@ import shutil
 import pandas as pd
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import config
+from typing import Dict
+
+# Initialize the logger for this specific module
+logger = logging.getLogger(__name__)
 
 def raw_vault_is_populated():
     """Checks if the raw vault directory exists and contains partitioned data."""
@@ -455,7 +478,7 @@ def reset_raw_vault():
         shutil.rmtree(config.RAW_VAULT_DIR)
     os.makedirs(config.RAW_VAULT_DIR, exist_ok=True)
 
-def get_survivorship_adjusted_universe():
+def get_survivorship_adjusted_universe() -> Dict[str, str]:
     """
     Retrieves dynamic point-in-time index matrices to eliminate survivorship bias, 
     injecting historically active and failed/delisted corporate tickers.
@@ -470,11 +493,10 @@ def get_survivorship_adjusted_universe():
         print(f"Error mapping sectors: {e}")
         return {}
 
-def ingest_raw_ticker(ticker, sector):
+def ingest_raw_ticker(ticker, sector) -> bool:
+    def ingest_raw_ticker(ticker, sector):
     """Thread-safe isolated extraction processing loop for a single ticker."""
     try:
-        # Explicitly disable multi-level indexes to keep the dataframe columns flat.
-        # This prevents silent failures during downstream technical analysis.
         df = yf.download(
             ticker, 
             start=config.START_DATE, 
@@ -484,27 +506,26 @@ def ingest_raw_ticker(ticker, sector):
             multi_level_index=False
         )
         
-        # Skip if data is empty or lacks sufficient history for indicator lookbacks (e.g., 252 trading days)
         if df.empty or len(df) < 252:
             return False
             
-        # Append metadata columns
         df['ticker'] = ticker
         df['sector'] = sector
         
-        # Hive partitioning save format: sector=Technology/AAPL.parquet
         out_dir = os.path.join(config.RAW_VAULT_DIR, f"sector={sector}")
         os.makedirs(out_dir, exist_ok=True)
         
-        # Save directly to PyArrow parquet
         df.to_parquet(os.path.join(out_dir, f"{ticker}.parquet"), engine='pyarrow')
         return True
+        
     except Exception as e:
+        # CRITICAL FIX: Logs the exact line and reason for the failure
+        logger.error(f"Ingestion failed for {ticker} in sector {sector}.", exc_info=True)
         return False
 
-def build_raw_vault(universe_map):
+def build_raw_vault(universe_map: Dict[str, str]) -> None:
     """Asynchronous pipeline leveraging host thread scaling to populate the local vault."""
-    print("Executing point-in-time survivorship-adjusted raw data acquisition layer...")
+    logger.info("Executing point-in-time survivorship-adjusted raw data acquisition layer...")
     reset_raw_vault()
     
     # Throttled max_workers to mitigate IP rate-limiting dropouts on public APIs like Yahoo Finance
@@ -556,6 +577,37 @@ import os
 from datetime import datetime, timedelta
 import pyarrow as pa
 import pandas as pd
+import argparse
+import logging
+import config
+
+# ==============================================================================
+# 0. CENTRALIZED LOGGING CONFIGURATION
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
+        logging.StreamHandler()                       # Prints to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import custom modules AFTER logging is configured
+import data_ingestion
+import feature_compiler
+import tournament
+
+def main():
+    logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
+    
+    # ... [rest of the arg parsing logic remains the same]
+
+    # Replace print statements with logger.info
+    if args.refresh_raw:
+        logger.info("[COMMAND] --refresh-raw detected. Synchronizing raw market data...")
+        # ...
 
 # ==============================================================================
 # 1. GLOBAL SYSTEM RUN MODE CONFIGURATION
@@ -573,7 +625,7 @@ END_DATE = datetime.now().strftime('%Y-%m-%d')
 RAW_VAULT_DIR = "./market_vault_raw"
 PROCESSED_VAULT_DIR = f"./market_vault_processed_{RUN_MODE.lower()}"
 RESULTS_FILE = "tournament_final_results.parquet"
-LIVE_LOG_FILE = "live_execution_log.parquet"
+LIVE_LOG_DIR = "./live_execution_ledger"
 PROD_MODELS_DIR = "./production_models"
 
 # ==============================================================================
@@ -637,6 +689,11 @@ NULLABLE_TYPES_MAPPER = {
     pa.float64(): pd.Float64Dtype(),
     pa.string(): pd.StringDtype()
 }
+
+# Add this to the bottom of config.py
+LOG_DIR = "./system_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+SYSTEM_LOG_FILE = os.path.join(LOG_DIR, "quantum_sentinel.log")
 
 --- FILE: ./dashboard.py ---
 
@@ -823,20 +880,12 @@ def populate_indicators(df):
         
     return df
 
-def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
-    """
-    Simulates a standard directional trade for every row.
-    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss.
-    Limits execution horizons via max_hold_days to prevent liquidity traps.
-    """
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    atrs = df['atr'].values
-    labels = np.zeros(len(df), dtype=np.int8)
-
-    for i in range(len(df) - max_hold_days):
-        if pd.isna(atrs[i]):
+@njit
+def _compute_rmultiple_labels(closes, highs, lows, atrs, rr_ratio, max_hold_days):
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int8)
+    for i in range(n - max_hold_days):
+        if np.isnan(atrs[i]):
             continue
             
         stop_loss = closes[i] - atrs[i]
@@ -848,11 +897,48 @@ def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
             if highs[j] >= tp:
                 labels[i] = 1
                 break
-                
-    df['target_label'] = labels
+    return labels
+
+def add_rmultiple_labels(df, rr_ratio=2.0, max_hold_days=20):
+    """
+    Simulates a standard directional trade for every row [2].
+    Assigns a '1' if the 2:1 risk/reward target is hit before the 1R ATR stop-loss [2].
+    """
+    # Delegates the heavy lifting to the highly optimized C-level compiled function
+    df['target_label'] = _compute_rmultiple_labels(
+        df['close'].values, df['high'].values, df['low'].values, df['atr'].values, 
+        rr_ratio, max_hold_days
+    )
     return df
 
+@njit
+def _compute_options_labels(closes, atrs, dte, target_premium_gain):
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int8)
+    for i in range(n - dte):
+        if np.isnan(atrs[i]):
+            continue
+            
+        entry_price = closes[i]
+        target_price = entry_price + (atrs[i] * 2) 
+        stop_loss = entry_price - atrs[i]
+
+        for j in range(i + 1, i + dte):
+            if closes[j] <= stop_loss:
+                break
+            if closes[j] >= target_price:
+                labels[i] = 1
+                break
+    return labels
+
 def add_options_labels(df, dte=21, target_premium_gain=0.50):
+    """
+    Simulates a Delta-adjusted option contract return [3].
+    """
+    df['option_target_label'] = _compute_options_labels(
+        df['close'].values, df['atr'].values, dte, target_premium_gain
+    )
+    return df
     """
     Simulates a Delta-adjusted option contract return.
     Accounts for time horizons across the specific Days to Expiration (DTE).

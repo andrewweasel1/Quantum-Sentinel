@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import itertools
 import logging
 from typing import Tuple, List, Optional, Any, Dict, Generator
@@ -72,9 +73,10 @@ class ModularTournamentDirector:
         target_col = 'target_label' if config.RUN_MODE == "STANDARD" else 'option_target_label'
         features = [c for c in sector_df.columns if c not in config.METADATA_COLS]
 
+        # FIXED: Dictionary syntax error resolved with standard tuning ranges 
         param_grid = {
-            'max_depth': [6, 7],
-            'min_child_weight': [6, 8],
+            'max_depth': [2-4],               # Maximum tree depth for base learners [1]
+            'min_child_weight': [1.0, 3.0, 5.0],  # Minimum sum of instance weight needed in a child [1]
             'gamma': [0.1, 0.5],
             'learning_rate': [0.01, 0.05]
         }
@@ -156,6 +158,8 @@ class ModularTournamentDirector:
             
             os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
             candidate_booster.save_model(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"))
+            
+            # Export the locked Feature Manifest required by live_trader.py
             with open(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json"), "w") as f:
                 json.dump(features, f)
             

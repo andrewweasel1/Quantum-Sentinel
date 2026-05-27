@@ -794,7 +794,7 @@ PARQUET_BLOCKSIZE = "256MiB"
 DASK_READ_KWARGS = {
     "engine": "pyarrow",
     "blocksize": PARQUET_BLOCKSIZE,
-    "split_row_groups": "adaptive",
+    "split_row_groups": "infer",
     "dtype_backend": "pyarrow"  
 }
 
@@ -1051,11 +1051,16 @@ class QuantitativeEvaluator:
         # 5. Generate Institutional Tearsheet
         logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
         try:
+            # FIX: Dynamically anchor the DatetimeIndex to the config window and use Business Days ('B').
+            # This ensures QuantStats applies the correct 252-day annualization math for Sharpe/Sortino ratios.
+            dummy_index = pd.bdate_range(end=config.END_DATE, periods=len(champion_returns))
+            champion_returns.index = dummy_index
+            benchmark_returns.index = dummy_index
+
             if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
-                bench_df.index = pd.date_range(start='2020-01-01', periods=len(bench_df), freq='D')
                 qs.reports.html(
-                    returns=bench_df['champion'], 
-                    benchmark=bench_df['benchmark'], 
+                    returns=champion_returns, 
+                    benchmark=benchmark_returns, 
                     title=f'Quantum Sentinel - {sector_name} Champion Profile (LLM FUSION)', 
                     output=f"tearsheet_{sector_name}.html"
                 )
@@ -1349,13 +1354,14 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     # ... [Keep the rest of the array memory staging and GPU push identical] ...
     
     # Stage continuous NumPy arrays for GPU transfer
-    closes = np.ascontiguousarray(df['close'].values.astype(np.float64))
-    highs = np.ascontiguousarray(df['high'].values.astype(np.float64))
-    lows = np.ascontiguousarray(df['low'].values.astype(np.float64))
-    volumes = np.ascontiguousarray(df['volume'].values.astype(np.float64))
-    returns = np.ascontiguousarray(df['returns'].values.astype(np.float64))
-    atrs = np.ascontiguousarray(df['atr'].fillna(0).values.astype(np.float64))
-    advs = np.ascontiguousarray(df['adv_20'].fillna(0).values.astype(np.float64))
+    # FIX: Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
+    closes = np.ascontiguousarray(df['close'].to_numpy(dtype=np.float64, na_value=np.nan))
+    highs = np.ascontiguousarray(df['high'].to_numpy(dtype=np.float64, na_value=np.nan))
+    lows = np.ascontiguousarray(df['low'].to_numpy(dtype=np.float64, na_value=np.nan))
+    volumes = np.ascontiguousarray(df['volume'].to_numpy(dtype=np.float64, na_value=np.nan))
+    returns = np.ascontiguousarray(df['returns'].to_numpy(dtype=np.float64, na_value=np.nan))
+    atrs = np.ascontiguousarray(df['atr'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
+    advs = np.ascontiguousarray(df['adv_20'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
     
     n = len(closes)
     

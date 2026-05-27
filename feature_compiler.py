@@ -1,13 +1,12 @@
 import os
+import math
 import shutil
 import logging
-from typing import Any, Tuple
-
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 import pandas_ta as ta
-from numba import njit
+from numba import cuda
 
 import config
 
@@ -17,203 +16,257 @@ import config
 logger = logging.getLogger(__name__)
 
 def processed_vault_is_populated() -> bool:
-    """Checks if the processed vault directory exists and contains data."""
     if not os.path.exists(config.PROCESSED_VAULT_DIR):
         return False
     subdirs = [d for d in os.listdir(config.PROCESSED_VAULT_DIR) if os.path.isdir(os.path.join(config.PROCESSED_VAULT_DIR, d))]
     return len(subdirs) > 0
 
 def reset_processed_vault() -> None:
-    """Clears existing processed data to prevent duplicate or corrupted legacy files."""
     if os.path.exists(config.PROCESSED_VAULT_DIR):
         shutil.rmtree(config.PROCESSED_VAULT_DIR)
     os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
 
 # ==============================================================================
-# 1. JIT-COMPILED MICROSTRUCTURE & TAIL-RISK SENSORS
+# 1. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
 # ==============================================================================
 
-@njit
-def compute_roll_spread(closes: np.ndarray, window: int = 20) -> np.ndarray:
-    """
-    Estimates the effective bid-ask spread using Roll's Serial Covariance model.
-    A negative serial covariance of price changes implies bid-ask bounce friction.
-    """
+@cuda.jit(fastmath=True)
+def compute_roll_spread_cuda(closes, spreads, window):
+    i = cuda.grid(1)
     n = len(closes)
-    spreads = np.zeros(n, dtype=np.float64)
-    diffs = np.zeros(n, dtype=np.float64)
     
-    for i in range(1, n):
-        diffs[i] = closes[i] - closes[i-1]
-
-    for i in range(window, n):
-        window_diffs = diffs[i-window+1:i+1]
-        x = window_diffs[1:]
-        y = window_diffs[:-1]
+    if i >= window and i < n:
+        mean_x = 0.0
+        mean_y = 0.0
         
-        # Calculate Numba-safe covariance
-        if len(x) > 1:
-            cov = np.sum((x - np.mean(x)) * (y - np.mean(y))) / (len(x) - 1)
-            if cov < 0:
-                spreads[i] = 2.0 * np.sqrt(-cov)
-            else:
-                spreads[i] = 0.0001 # Minimum noise floor
-    return spreads
+        # Calculate means
+        for j in range(i - window + 1, i):
+            mean_x += (closes[j+1] - closes[j])
+            mean_y += (closes[j] - closes[j-1])
+        
+        mean_x /= (window - 1)
+        mean_y /= (window - 1)
 
-@njit
-def compute_crash_risk(returns: np.ndarray, window: int = 60) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Calculates Negative Conditional Skewness (NCSKEW) and Down-to-Up Volatility (DUVOL).
-    These metrics allow the model to detect impending asymmetrical crashes.
-    """
+        # Calculate sample covariance
+        cov = 0.0
+        for j in range(i - window + 1, i):
+            x = (closes[j+1] - closes[j])
+            y = (closes[j] - closes[j-1])
+            cov += (x - mean_x) * (y - mean_y)
+            
+        cov /= (window - 2)
+
+        if cov < 0:
+            spreads[i] = 2.0 * math.sqrt(-cov)
+        else:
+            spreads[i] = 0.0001
+
+@cuda.jit(fastmath=True)
+def compute_crash_risk_cuda(returns, ncskew, duvol, window):
+    i = cuda.grid(1)
     n = len(returns)
-    ncskew = np.zeros(n, dtype=np.float64)
-    duvol = np.zeros(n, dtype=np.float64)
     
-    for i in range(window, n):
-        window_ret = returns[i-window:i]
-        mean_ret = np.mean(window_ret)
-        std_ret = np.std(window_ret)
+    if i >= window and i < n:
+        # Calculate Mean
+        mean_ret = 0.0
+        for j in range(i - window, i):
+            mean_ret += returns[j]
+        mean_ret /= window
+        
+        # Calculate Variance & Standard Deviation
+        var_ret = 0.0
+        for j in range(i - window, i):
+            var_ret += (returns[j] - mean_ret)**2
+        std_ret = math.sqrt(var_ret / window)
         
         # 1. NCSKEW
         if std_ret > 0:
-            skew = np.sum(((window_ret - mean_ret) / std_ret)**3) / window
-            ncskew[i] = -skew  
+            skew = 0.0
+            for j in range(i - window, i):
+                skew += ((returns[j] - mean_ret) / std_ret)**3
+            ncskew[i] = -(skew / window)
             
         # 2. DUVOL
-        down_returns = window_ret[window_ret < mean_ret]
-        up_returns = window_ret[window_ret > mean_ret]
+        down_sum, up_sum = 0.0, 0.0
+        down_count, up_count = 0, 0
         
-        if len(down_returns) > 2 and len(up_returns) > 2:
-            var_down = np.var(down_returns)
-            var_up = np.var(up_returns)
+        for j in range(i - window, i):
+            if returns[j] < mean_ret:
+                down_sum += (returns[j] - mean_ret)**2
+                down_count += 1
+            elif returns[j] > mean_ret:
+                up_sum += (returns[j] - mean_ret)**2
+                up_count += 1
+                
+        if down_count > 2 and up_count > 2:
+            var_down = down_sum / (down_count - 1)
+            var_up = up_sum / (up_count - 1)
             if var_up > 0 and var_down > 0:
-                duvol[i] = np.log(var_down / var_up)
-                
-    return ncskew, duvol
+                duvol[i] = math.log(var_down / var_up)
 
-@njit
-def compute_amihud_illiquidity(returns: np.ndarray, closes: np.ndarray, volumes: np.ndarray, window: int = 20) -> np.ndarray:
-    """
-    Amihud Illiquidity Measure: Captures the daily price response associated with one dollar of trading volume.
-    """
+@cuda.jit(fastmath=True)
+def compute_amihud_illiquidity_cuda(returns, closes, volumes, amihud, window):
+    i = cuda.grid(1)
     n = len(returns)
-    amihud = np.zeros(n, dtype=np.float64)
     
-    for i in range(window, n):
-        window_ret = np.abs(returns[i-window:i])
-        window_dollar_vol = closes[i-window:i] * volumes[i-window:i]
+    if i >= window and i < n:
+        amihud_sum = 0.0
+        valid_days = 0
         
-        # Prevent division by zero
-        valid_idx = window_dollar_vol > 0
-        if np.sum(valid_idx) > 0:
-            amihud[i] = np.mean(window_ret[valid_idx] / window_dollar_vol[valid_idx])
-            
-    return amihud
+        for j in range(i - window, i):
+            dollar_vol = closes[j] * volumes[j]
+            if dollar_vol > 0:
+                amihud_sum += math.fabs(returns[j]) / dollar_vol
+                valid_days += 1
+                
+        if valid_days > 0:
+            amihud[i] = amihud_sum / valid_days
 
-# ==============================================================================
-# 2. FRICTION-ADJUSTED TRIPLE BARRIER LABEL GENERATION 
-# ==============================================================================
-
-@njit
-def _compute_friction_adjusted_labels(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, 
-                                      atrs: np.ndarray, spreads: np.ndarray, current_volumes: np.ndarray, 
-                                      advs: np.ndarray, rr_ratio: float, max_hold_days: int) -> np.ndarray:
-    """
-    Triple-Barrier Method with Dynamic Friction.
-    A trade is only labeled as successful (1) if it hits the profit target AFTER 
-    paying the Corwin-Schultz/Roll bid-ask spread and the square-root market impact slippage.
-    """
+@cuda.jit(fastmath=True)
+def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_volumes, advs, labels, rr_ratio, max_hold_days):
+    i = cuda.grid(1)
     n = len(closes)
-    labels = np.zeros(n, dtype=np.int8)
     
-    for i in range(n - max_hold_days):
-        if np.isnan(atrs[i]) or np.isnan(spreads[i]) or advs[i] == 0:
-            continue
+    if i < n - max_hold_days:
+        if not (math.isnan(atrs[i]) or math.isnan(spreads[i]) or advs[i] == 0):
+            # 1. Estimate Entry Friction
+            vol_ratio = current_volumes[i] / advs[i]
+            entry_slippage = closes[i] * 0.001 * math.sqrt(vol_ratio)
+            entry_friction = (spreads[i] / 2.0) + entry_slippage
             
-        # 1. Estimate Entry Friction
-        vol_ratio = current_volumes[i] / advs[i]
-        entry_slippage = closes[i] * 0.001 * np.sqrt(vol_ratio) 
-        entry_friction = (spreads[i] / 2.0) + entry_slippage
-        
-        true_entry_price = closes[i] + entry_friction
-        stop_loss = true_entry_price - atrs[i]
-        take_profit = true_entry_price + (atrs[i] * rr_ratio)
-        
-        # 2. Path Simulation (Triple Barrier)
-        for j in range(i + 1, i + max_hold_days):
-            # Lower barrier hit -> Stop Loss Executed
-            if lows[j] <= stop_loss:
-                break
-                
-            # Upper barrier hit -> Must clear the exit friction to be truly profitable
-            exit_vol_ratio = current_volumes[j] / advs[j]
-            exit_friction = (spreads[j] / 2.0) + (closes[j] * 0.001 * np.sqrt(exit_vol_ratio))
+            true_entry_price = closes[i] + entry_friction
+            stop_loss = true_entry_price - atrs[i]
+            take_profit = true_entry_price + (atrs[i] * rr_ratio)
             
-            if (highs[j] - exit_friction) >= take_profit:
-                labels[i] = 1
-                break
+            # 2. Path Simulation
+            for j in range(i + 1, i + max_hold_days):
+                if lows[j] <= stop_loss:
+                    break
+                    
+                exit_vol_ratio = current_volumes[j] / advs[j]
+                exit_friction = (spreads[j] / 2.0) + (closes[j] * 0.001 * math.sqrt(exit_vol_ratio))
                 
-    return labels
+                if (highs[j] - exit_friction) >= take_profit:
+                    labels[i] = 1
+                    break
 
-def apply_institutional_labels(df: pd.DataFrame, rr_ratio: float = config.RR_RATIO, max_hold_days: int = config.MAX_HOLD_DAYS) -> pd.DataFrame:
-    df['target_label'] = _compute_friction_adjusted_labels(
-        df['close'].values, df['high'].values, df['low'].values, df['atr'].values, 
-        df['roll_spread'].values, df['volume'].values, df['adv_20'].values, 
-        rr_ratio, max_hold_days
-    )
-    return df
+@cuda.jit(fastmath=True)
+def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
+    i = cuda.grid(1)
+    n = len(closes)
+    
+    if i < n - dte:
+        if not math.isnan(atrs[i]) and atrs[i] > 0:
+            entry = closes[i]
+            target = entry + (atrs[i] * target_premium_gain)
+            stop = entry - atrs[i]
+            
+            for j in range(i + 1, i + dte):
+                if closes[j] <= stop:
+                    break
+                if closes[j] >= target:
+                    labels[i] = 1
+                    break
 
 # ==============================================================================
-# 3. DASK WORKER EXECUTION MAPPING
+# 2. DASK WORKER EXECUTION MAPPING
 # ==============================================================================
 
 def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Applies the massive institutional sensor suite to a localized data chunk.
-    Executed lazily inside Dask worker allocation threads.
+    Applies massive mechanical sensors to a localized data chunk using 
+    asynchronous CUDA kernel dispatches.
     """
     if df.empty or len(df) < 252:
         return pd.DataFrame(columns=df.columns)
         
     df.columns = [c.lower() for c in df.columns]
     
-    # 1. Base Analytics
+    # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
     
-    # 2. Market Microstructure & Liquidity
-    df['roll_spread'] = compute_roll_spread(df['close'].values, window=20)
-    df['amihud_illiq'] = compute_amihud_illiquidity(df['returns'].values, df['close'].values, df['volume'].values, window=20)
+    # Stage continuous NumPy arrays for GPU transfer
+    closes = np.ascontiguousarray(df['close'].values.astype(np.float64))
+    highs = np.ascontiguousarray(df['high'].values.astype(np.float64))
+    lows = np.ascontiguousarray(df['low'].values.astype(np.float64))
+    volumes = np.ascontiguousarray(df['volume'].values.astype(np.float64))
+    returns = np.ascontiguousarray(df['returns'].values.astype(np.float64))
+    atrs = np.ascontiguousarray(df['atr'].fillna(0).values.astype(np.float64))
+    advs = np.ascontiguousarray(df['adv_20'].fillna(0).values.astype(np.float64))
     
-    # 3. Crash Risk & Asymmetry
-    ncskew, duvol = compute_crash_risk(df['returns'].values, window=60)
-    df['ncskew'] = ncskew
-    df['duvol'] = duvol
+    n = len(closes)
     
-    # 4. Friction-Adjusted Labeling
+    # Initialize blank output arrays
+    spreads = np.zeros(n, dtype=np.float64)
+    amihud = np.zeros(n, dtype=np.float64)
+    ncskew = np.zeros(n, dtype=np.float64)
+    duvol = np.zeros(n, dtype=np.float64)
+    labels = np.zeros(n, dtype=np.int8)
+
+    # 1. PUSH MEMORY TO VRAM
+    d_closes = cuda.to_device(closes)
+    d_highs = cuda.to_device(highs)
+    d_lows = cuda.to_device(lows)
+    d_volumes = cuda.to_device(volumes)
+    d_returns = cuda.to_device(returns)
+    d_atrs = cuda.to_device(atrs)
+    d_advs = cuda.to_device(advs)
+    
+    d_spreads = cuda.to_device(spreads)
+    d_amihud = cuda.to_device(amihud)
+    d_ncskew = cuda.to_device(ncskew)
+    d_duvol = cuda.to_device(duvol)
+    d_labels = cuda.to_device(labels)
+
+    # 2. KERNEL THREAD CONFIGURATION
+    threads_per_block = 256
+    blocks_per_grid = math.ceil(n / threads_per_block)
+
+    # 3. DISPATCH ASYNCHRONOUS KERNELS
+    compute_roll_spread_cuda[blocks_per_grid, threads_per_block](d_closes, d_spreads, 20)
+    compute_amihud_illiquidity_cuda[blocks_per_grid, threads_per_block](d_returns, d_closes, d_volumes, d_amihud, 20)
+    compute_crash_risk_cuda[blocks_per_grid, threads_per_block](d_returns, d_ncskew, d_duvol, 60)
+    
+    # Synchronize to ensure the bid-ask spreads are fully calculated before running label friction logic
+    cuda.synchronize()
+
     if config.RUN_MODE == "STANDARD":
-        df = apply_institutional_labels(df)
-        
-    # Drop NaNs to protect XGBoost DMatrix creation
+        compute_friction_labels_cuda[blocks_per_grid, threads_per_block](
+            d_closes, d_highs, d_lows, d_atrs, d_spreads, d_volumes, d_advs, d_labels, 2.0, 20
+        )
+        df['target_label'] = d_labels.copy_to_host()
+    else:
+        compute_options_labels_cuda[blocks_per_grid, threads_per_block](
+            d_closes, d_atrs, d_labels, 21, 0.50
+        )
+        df['option_target_label'] = d_labels.copy_to_host()
+
+    # 4. PULL VRAM DATA BACK TO HOST RAM
+    df['roll_spread'] = d_spreads.copy_to_host()
+    df['amihud_illiq'] = d_amihud.copy_to_host()
+    df['ncskew'] = d_ncskew.copy_to_host()
+    df['duvol'] = d_duvol.copy_to_host()
+
     df = df.dropna()
     return df
 
 def compile_features_from_raw() -> None:
     """
     Orchestrates the offline Dask-powered transformation pipeline.
+    Reads partitioned raw data out-of-core, dispatches CUDA instructions, and flushes to vault.
     """
     if not os.path.exists(config.RAW_VAULT_DIR):
         logger.error("Raw storage vault missing. Run ingestion sequence first.")
         return
         
-    logger.info("Initiating offline Dask-powered feature compilation using institutional metrics...")
+    logger.info("Engaging CUDA FastMath compilation for institutional microstructure sensors...")
     reset_processed_vault()
 
     ddf = dd.read_parquet(config.RAW_VAULT_DIR, **config.DASK_READ_KWARGS)
-
-    # Apply the advanced processing map to each partition
+    
+    # Map the massive CUDA block to Dask partition paths
     ddf_processed = ddf.map_partitions(compute_partition_features)
 
     ddf_processed.to_parquet(
@@ -222,4 +275,4 @@ def compile_features_from_raw() -> None:
         partition_on=['sector'],
         write_metadata_file=False
     )
-    logger.info(f"Friction-adjusted matrices safely exported to {config.PROCESSED_VAULT_DIR}.")
+    logger.info(f"Friction-adjusted memory arrays safely exported to {config.PROCESSED_VAULT_DIR}.")

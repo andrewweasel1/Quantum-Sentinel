@@ -22,6 +22,44 @@ import config
 # ==============================================================================
 logger = logging.getLogger(__name__)
 
+# ==============================================================================
+# 1. OUT-OF-CORE BATCH ITERATOR (VRAM OPTIMIZATION)
+# ==============================================================================
+class DataFrameIter(xgb.DataIter):
+    """
+    A custom XGBoost Data Iterator that feeds data in localized chunks [2].
+    Designed to work with ExtMemQuantileDMatrix to prevent 12GB VRAM OOM 
+    on hardware like the RTX 4070 by caching data across the host and device [3].
+    """
+    def __init__(self, X: pd.DataFrame, y: pd.Series, batch_size: int = 100000):
+        # Initialize the base class. Setting on_host=True caches on CPU RAM [5]
+        super().__init__(on_host=True)
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.n_batches = int(np.ceil(len(X) / batch_size))
+        self.it = 0
+
+    def reset(self) -> None:
+        """Resets the iterator to the beginning [6]."""
+        self.it = 0
+
+    def next(self, input_data: Any) -> int:
+        """Yields the next batch of data to the XGBoost internal API [2]."""
+        if self.it == self.n_batches:
+            return 0
+        start = self.it * self.batch_size
+        end = min((self.it + 1) * self.batch_size, len(self.X))
+        
+        # Pass the sliced batch to the internal XGBoost input function [2]
+        input_data(data=self.X.iloc[start:end], label=self.y.iloc[start:end])
+        
+        self.it += 1
+        return 1
+
+# ==============================================================================
+# 2. TOURNAMENT PIPELINE
+# ==============================================================================
 class ModularTournamentDirector:
     def __init__(self) -> None:
         """
@@ -40,7 +78,6 @@ class ModularTournamentDirector:
         indices = np.array_split(df.index, n_groups)
         group_ids = list(range(n_groups))
         
-        # Generate all combinations of test groups
         for test_combo in combinations(group_ids, test_groups):
             test_indices = []
             for i in test_combo:
@@ -49,8 +86,6 @@ class ModularTournamentDirector:
             test_df = df.loc[test_indices]
             train_df = df.drop(index=test_indices)
             
-            # Apply Purging and Embargoing to the boundaries of the train set
-            # to strictly prevent information leakage.
             embargo_gap = config.MAX_HOLD_DAYS 
             for test_idx in test_combo:
                 boundary_start = indices[test_idx] - embargo_gap
@@ -61,9 +96,8 @@ class ModularTournamentDirector:
 
     def tune_sector_grid(self, sector_name: str) -> None:
         """
-        Tests the hyperparameter grid across multiple CPCV backtest paths. 
-        Records every combination's returns to export a full matrix for Probability of Backtest Overfitting (PBO)
-        and jsharpe False Discovery Rate (FDR) control in the evaluator script.
+        Tests the hyperparameter grid across multiple CPCV backtest paths using VRAM-optimized structures.
+        Records every combination's returns to export a full matrix for PBO evaluation.
         """
         logger.info(f"--- Initiating CPCV Tournament for Sector: {sector_name} ---")
         
@@ -77,12 +111,12 @@ class ModularTournamentDirector:
         target_col = 'target_label' if config.RUN_MODE == "STANDARD" else 'option_target_label'
         features = [c for c in sector_df.columns if c not in config.METADATA_COLS]
 
-        # FIXED: Dictionary syntax error resolved with standard tuning ranges 
         param_grid = {
-            'max_depth': [2-4],               # Maximum tree depth for base learners [1]
-            'min_child_weight': [1.0, 3.0, 5.0],  # Minimum sum of instance weight needed in a child [1]
+            'max_depth': [7, 8],               
+            'min_child_weight': [1.0, 3.0, 5.0],  
             'gamma': [0.1, 0.5],
-            'learning_rate': [0.01, 0.05]
+            'learning_rate': [0.01, 0.05],
+            'subsample': [0.8]  # Required < 1.0 fraction to enable stochastic sampling routines
         }
         
         keys, values = zip(*param_grid.items())
@@ -102,6 +136,9 @@ class ModularTournamentDirector:
             params['objective'] = 'binary:logistic'
             params['grow_policy'] = 'lossguide'
             
+            # RTX 4070 Optimization: Instruct GPU to sample instances with higher gradient values [4]
+            params['sampling_method'] = 'gradient_based' 
+            
             trial_oos_returns = []
             
             # 2. Combinatorial Purged Cross-Validation
@@ -110,8 +147,13 @@ class ModularTournamentDirector:
                 X_train, y_train = train_df[features], train_df[target_col]
                 X_test, y_test = test_df[features], test_df[target_col]
 
-                dtrain = xgb.QuantileDMatrix(X_train, label=y_train)
-                dtest = xgb.QuantileDMatrix(X_test, label=y_test, ref=dtrain)
+                # RTX 4070 Optimization: Initialize custom Iterators [2, 5]
+                train_iter = DataFrameIter(X_train, y_train, batch_size=100000)
+                test_iter = DataFrameIter(X_test, y_test, batch_size=100000)
+                
+                # Stream the iterators dynamically into the ExtMemQuantileDMatrix [3]
+                dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
+                dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
                 
                 bst = xgb.train(
                     params,
@@ -126,24 +168,20 @@ class ModularTournamentDirector:
                 preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
                 signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
                 
-                # Assuming 'close' exists in the metadata block to calculate strategy return
                 forward_returns = test_df['close'].pct_change().fillna(0).values
                 strategy_returns = signals * forward_returns
                 trial_oos_returns.extend(strategy_returns)
 
-                # Capture the pure benchmark returns on the first trial to pass to quantstats
                 if not benchmark_calculated:
                     benchmark_returns.extend(forward_returns)
 
-                del dtrain, dtest
+                del dtrain, dtest, train_iter, test_iter
                 
             benchmark_calculated = True
             trial_oos_returns = np.array(trial_oos_returns)
             
-            # Store this specific hyperparameter trial in our comprehensive matrix
             returns_matrix[f"trial_{trial_idx}"] = trial_oos_returns
             
-            # Calculate standard Sharpe Ratio internally just to pick a local candidate
             if np.std(trial_oos_returns) > 0:
                 trial_sr = np.mean(trial_oos_returns) / np.std(trial_oos_returns)
             else:
@@ -156,18 +194,18 @@ class ModularTournamentDirector:
 
         # 4. Matrix Export & Candidate Staging
         if best_params is not None and len(best_returns) > 0:
-            # Train the candidate model on the entire dataset for production staging
-            d_full = xgb.DMatrix(sector_df[features], label=sector_df[target_col])
+            
+            # Train the final candidate using the external memory matrices
+            full_iter = DataFrameIter(sector_df[features], sector_df[target_col], batch_size=100000)
+            d_full = xgb.ExtMemQuantileDMatrix(full_iter)
             candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
             
             os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
             candidate_booster.save_model(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"))
             
-            # Export the locked Feature Manifest required by live_trader.py
             with open(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json"), "w") as f:
                 json.dump(features, f)
             
-            # Export data structures as Parquet files for the evaluator.py engine
             matrix_df = pd.DataFrame(returns_matrix)
             matrix_df.to_parquet(f"returns_matrix_{sector_name}.parquet", engine='pyarrow')
             
@@ -750,6 +788,7 @@ NULLABLE_TYPES_MAPPER = {
 
 import os
 import glob
+import itertools
 import logging
 from typing import Optional
 
@@ -757,7 +796,6 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import jsharpe
-import pypbo
 import quantstats as qs
 
 import config
@@ -771,10 +809,10 @@ class QuantitativeEvaluator:
     def __init__(self) -> None:
         """
         Initializes the Evaluation suite. It relies on the Parquet matrices
-        and benchmark files exported by the newly refactored tournament.py.
+        and benchmark files exported by tournament.py.
         """
         self.confidence_level = 0.95
-        self.pbo_splits = 8
+        self.pbo_partitions = 8
 
     def compute_trial_p_values(self, returns_matrix: pd.DataFrame) -> np.ndarray:
         """
@@ -790,10 +828,8 @@ class QuantitativeEvaluator:
 
             # Calculate Probabilistic Sharpe Ratio (PSR) for the trial
             try:
-                # Attempt to use jsharpe native computation
                 psr = jsharpe.probabilistic_sharpe_ratio(returns)
             except Exception:
-                # Fallback to explicit math if the API signature expects moments
                 sr = np.mean(returns) / np.std(returns)
                 skewness = stats.skew(returns)
                 kurt = stats.kurtosis(returns)
@@ -803,10 +839,60 @@ class QuantitativeEvaluator:
                 denom = np.sqrt(1 - skewness * sr + ((kurt - 1) / 4) * sr**2)
                 psr = stats.norm.cdf(stat / denom)
 
-            # p-value is the probability that the true Sharpe Ratio is NOT > 0
             p_values.append(1.0 - float(psr))
             
         return np.array(p_values)
+
+    def calculate_native_pbo(self, returns_matrix: pd.DataFrame) -> float:
+        """
+        Natively calculates the Probability of Backtest Overfitting (PBO) by 
+        implementing the Bailey et al. (2015) combinatorial framework.
+        """
+        mat = returns_matrix.values
+        T, N = mat.shape
+        
+        if T < self.pbo_partitions or N < 2:
+            logger.warning("Not enough data or trials to compute PBO meaningfully.")
+            return 0.0
+            
+        # 1. Split timeline into equal, contiguous partitions
+        partitions = np.array_split(mat, self.pbo_partitions, axis=0)
+        partition_indices = list(range(self.pbo_partitions))
+        
+        # 2. Form all Combinatorial In-Sample (IS) and Out-Of-Sample (OOS) paths
+        is_combos = list(itertools.combinations(partition_indices, self.pbo_partitions // 2))
+        
+        logits = []
+        for is_idx in is_combos:
+            oos_idx = [i for i in partition_indices if i not in is_idx]
+            
+            is_mat = np.vstack([partitions[i] for i in is_idx])
+            oos_mat = np.vstack([partitions[i] for i in oos_idx])
+            
+            # 3. Calculate Sharpe Ratios for both sets
+            is_std = np.std(is_mat, axis=0)
+            is_std[is_std == 0] = 1e-8  # Prevent division by zero
+            is_sr = np.mean(is_mat, axis=0) / is_std
+            
+            oos_std = np.std(oos_mat, axis=0)
+            oos_std[oos_std == 0] = 1e-8
+            oos_sr = np.mean(oos_mat, axis=0) / oos_std
+            
+            # 4. Identify Best IS Strategy and find its OOS rank
+            best_is_idx = np.argmax(is_sr)
+            best_is_oos_sr = oos_sr[best_is_idx]
+            
+            # Rank is the fraction of configurations it beat out-of-sample
+            rank = np.sum(oos_sr <= best_is_oos_sr) / N
+            rank = np.clip(rank, 1e-5, 1.0 - 1e-5)
+            
+            # 5. Logit transformation
+            logit = np.log(rank / (1.0 - rank))
+            logits.append(logit)
+            
+        # 6. PBO is the fraction of configurations where OOS performance fell below the median
+        pbo_value = np.sum(np.array(logits) < 0) / len(logits)
+        return float(pbo_value)
 
     def assess_sector(self, sector_name: str) -> bool:
         """
@@ -832,7 +918,6 @@ class QuantitativeEvaluator:
         p_values = self.compute_trial_p_values(returns_matrix)
         passes_fdr = jsharpe.control_for_FDR(p_values, alpha=1.0 - self.confidence_level)
         
-        # We verify if the champion (the trial with the lowest p-value) passes the FDR hurdle
         best_trial_idx = np.argmin(p_values)
         if not passes_fdr[best_trial_idx]:
             logger.warning(f"[{sector_name}] REJECTED: Failed False Discovery Rate (FDR) control.")
@@ -842,8 +927,7 @@ class QuantitativeEvaluator:
         # 2. Probability of Backtest Overfitting (PBO)
         logger.info("2. Evaluating Probability of Backtest Overfitting (PBO)...")
         try:
-            pbo_engine = pypbo.pbo(returns_matrix, S=self.pbo_splits, metric='sharpe')
-            overfit_prob = pbo_engine.pbo_value
+            overfit_prob = self.calculate_native_pbo(returns_matrix)
             logger.info(f"[{sector_name}] PBO: {overfit_prob * 100:.2f}%")
             
             if overfit_prob > 0.50:
@@ -888,7 +972,7 @@ class QuantitativeEvaluator:
         except Exception as e:
             logger.error(f"[{sector_name}] Failed to generate QuantStats tearsheet: {e}")
 
-        # Promote candidate model to champion using os.replace to safely overwrite old champions
+        # Promote candidate model to champion
         candidate_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json")
         champion_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
         
@@ -908,7 +992,6 @@ class QuantitativeEvaluator:
         """
         logger.info("=== COMMENCING POST-TOURNAMENT EVALUATION ===")
         
-        # Dynamically discover all sector files dumped by the tournament
         matrix_files = glob.glob("returns_matrix_*.parquet")
 
         if not matrix_files:
@@ -928,6 +1011,12 @@ class QuantitativeEvaluator:
 if __name__ == "__main__":
     evaluator = QuantitativeEvaluator()
     evaluator.run_evaluation_gauntlet()
+Removing the Package
+You can now safely remove pypbo and its limiting statsmodels 0.8.0 requirement from your requirements.txt:
+# Institutional Quantitative Metrics
+jsharpe
+quantstats
+statsmodels>=0.13.0
 
 --- FILE: ./dashboard.py ---
 
@@ -945,6 +1034,7 @@ import config
 st.set_page_config(page_title="Quantum Sentinel Analytics Hub", layout="wide", page_icon="🛡️")
 
 # Force strict HTTP verification layers directly within session allocations
+# Force strict HTTP verification layers directly within session allocations
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
@@ -953,11 +1043,19 @@ if not st.session_state["authenticated"]:
     user_input = st.text_input("Username Identification Profile:")
     pass_input = st.text_input("Secret Clearance Authentication Key:", type="password")
     
-    # Placeholder authentication logic
+    valid_user = os.environ.get("DASHBOARD_USER") 
+    valid_pass = os.environ.get("DASHBOARD_PASS")
+    
+    if not valid_user or not valid_pass:
+        st.error("CRITICAL: Security environment variables (DASHBOARD_USER / DASHBOARD_PASS) are missing.")
+        st.stop()
+        
     if st.button("Authenticate"):
-        if user_input == "admin" and pass_input == "admin": # Replace with secure env vars in production
+        if user_input == valid_user and pass_input == valid_pass: 
             st.session_state["authenticated"] = True
             st.rerun()
+        else:
+            st.error("Authentication failed. Unauthorized access attempt logged.")
     st.stop()
 
 # ==============================================================================
@@ -1162,15 +1260,14 @@ with tab4:
 --- FILE: ./feature_compiler.py ---
 
 import os
+import math
 import shutil
 import logging
-from typing import Any, Tuple
-
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 import pandas_ta as ta
-from numba import njit
+from numba import cuda
 
 import config
 
@@ -1180,203 +1277,257 @@ import config
 logger = logging.getLogger(__name__)
 
 def processed_vault_is_populated() -> bool:
-    """Checks if the processed vault directory exists and contains data."""
     if not os.path.exists(config.PROCESSED_VAULT_DIR):
         return False
     subdirs = [d for d in os.listdir(config.PROCESSED_VAULT_DIR) if os.path.isdir(os.path.join(config.PROCESSED_VAULT_DIR, d))]
     return len(subdirs) > 0
 
 def reset_processed_vault() -> None:
-    """Clears existing processed data to prevent duplicate or corrupted legacy files."""
     if os.path.exists(config.PROCESSED_VAULT_DIR):
         shutil.rmtree(config.PROCESSED_VAULT_DIR)
     os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
 
 # ==============================================================================
-# 1. JIT-COMPILED MICROSTRUCTURE & TAIL-RISK SENSORS
+# 1. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
 # ==============================================================================
 
-@njit
-def compute_roll_spread(closes: np.ndarray, window: int = 20) -> np.ndarray:
-    """
-    Estimates the effective bid-ask spread using Roll's Serial Covariance model.
-    A negative serial covariance of price changes implies bid-ask bounce friction.
-    """
+@cuda.jit(fastmath=True)
+def compute_roll_spread_cuda(closes, spreads, window):
+    i = cuda.grid(1)
     n = len(closes)
-    spreads = np.zeros(n, dtype=np.float64)
-    diffs = np.zeros(n, dtype=np.float64)
     
-    for i in range(1, n):
-        diffs[i] = closes[i] - closes[i-1]
-
-    for i in range(window, n):
-        window_diffs = diffs[i-window+1:i+1]
-        x = window_diffs[1:]
-        y = window_diffs[:-1]
+    if i >= window and i < n:
+        mean_x = 0.0
+        mean_y = 0.0
         
-        # Calculate Numba-safe covariance
-        if len(x) > 1:
-            cov = np.sum((x - np.mean(x)) * (y - np.mean(y))) / (len(x) - 1)
-            if cov < 0:
-                spreads[i] = 2.0 * np.sqrt(-cov)
-            else:
-                spreads[i] = 0.0001 # Minimum noise floor
-    return spreads
+        # Calculate means
+        for j in range(i - window + 1, i):
+            mean_x += (closes[j+1] - closes[j])
+            mean_y += (closes[j] - closes[j-1])
+        
+        mean_x /= (window - 1)
+        mean_y /= (window - 1)
 
-@njit
-def compute_crash_risk(returns: np.ndarray, window: int = 60) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Calculates Negative Conditional Skewness (NCSKEW) and Down-to-Up Volatility (DUVOL).
-    These metrics allow the model to detect impending asymmetrical crashes.
-    """
+        # Calculate sample covariance
+        cov = 0.0
+        for j in range(i - window + 1, i):
+            x = (closes[j+1] - closes[j])
+            y = (closes[j] - closes[j-1])
+            cov += (x - mean_x) * (y - mean_y)
+            
+        cov /= (window - 2)
+
+        if cov < 0:
+            spreads[i] = 2.0 * math.sqrt(-cov)
+        else:
+            spreads[i] = 0.0001
+
+@cuda.jit(fastmath=True)
+def compute_crash_risk_cuda(returns, ncskew, duvol, window):
+    i = cuda.grid(1)
     n = len(returns)
-    ncskew = np.zeros(n, dtype=np.float64)
-    duvol = np.zeros(n, dtype=np.float64)
     
-    for i in range(window, n):
-        window_ret = returns[i-window:i]
-        mean_ret = np.mean(window_ret)
-        std_ret = np.std(window_ret)
+    if i >= window and i < n:
+        # Calculate Mean
+        mean_ret = 0.0
+        for j in range(i - window, i):
+            mean_ret += returns[j]
+        mean_ret /= window
+        
+        # Calculate Variance & Standard Deviation
+        var_ret = 0.0
+        for j in range(i - window, i):
+            var_ret += (returns[j] - mean_ret)**2
+        std_ret = math.sqrt(var_ret / window)
         
         # 1. NCSKEW
         if std_ret > 0:
-            skew = np.sum(((window_ret - mean_ret) / std_ret)**3) / window
-            ncskew[i] = -skew  
+            skew = 0.0
+            for j in range(i - window, i):
+                skew += ((returns[j] - mean_ret) / std_ret)**3
+            ncskew[i] = -(skew / window)
             
         # 2. DUVOL
-        down_returns = window_ret[window_ret < mean_ret]
-        up_returns = window_ret[window_ret > mean_ret]
+        down_sum, up_sum = 0.0, 0.0
+        down_count, up_count = 0, 0
         
-        if len(down_returns) > 2 and len(up_returns) > 2:
-            var_down = np.var(down_returns)
-            var_up = np.var(up_returns)
+        for j in range(i - window, i):
+            if returns[j] < mean_ret:
+                down_sum += (returns[j] - mean_ret)**2
+                down_count += 1
+            elif returns[j] > mean_ret:
+                up_sum += (returns[j] - mean_ret)**2
+                up_count += 1
+                
+        if down_count > 2 and up_count > 2:
+            var_down = down_sum / (down_count - 1)
+            var_up = up_sum / (up_count - 1)
             if var_up > 0 and var_down > 0:
-                duvol[i] = np.log(var_down / var_up)
-                
-    return ncskew, duvol
+                duvol[i] = math.log(var_down / var_up)
 
-@njit
-def compute_amihud_illiquidity(returns: np.ndarray, closes: np.ndarray, volumes: np.ndarray, window: int = 20) -> np.ndarray:
-    """
-    Amihud Illiquidity Measure: Captures the daily price response associated with one dollar of trading volume.
-    """
+@cuda.jit(fastmath=True)
+def compute_amihud_illiquidity_cuda(returns, closes, volumes, amihud, window):
+    i = cuda.grid(1)
     n = len(returns)
-    amihud = np.zeros(n, dtype=np.float64)
     
-    for i in range(window, n):
-        window_ret = np.abs(returns[i-window:i])
-        window_dollar_vol = closes[i-window:i] * volumes[i-window:i]
+    if i >= window and i < n:
+        amihud_sum = 0.0
+        valid_days = 0
         
-        # Prevent division by zero
-        valid_idx = window_dollar_vol > 0
-        if np.sum(valid_idx) > 0:
-            amihud[i] = np.mean(window_ret[valid_idx] / window_dollar_vol[valid_idx])
-            
-    return amihud
+        for j in range(i - window, i):
+            dollar_vol = closes[j] * volumes[j]
+            if dollar_vol > 0:
+                amihud_sum += math.fabs(returns[j]) / dollar_vol
+                valid_days += 1
+                
+        if valid_days > 0:
+            amihud[i] = amihud_sum / valid_days
 
-# ==============================================================================
-# 2. FRICTION-ADJUSTED TRIPLE BARRIER LABEL GENERATION 
-# ==============================================================================
-
-@njit
-def _compute_friction_adjusted_labels(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, 
-                                      atrs: np.ndarray, spreads: np.ndarray, current_volumes: np.ndarray, 
-                                      advs: np.ndarray, rr_ratio: float, max_hold_days: int) -> np.ndarray:
-    """
-    Triple-Barrier Method with Dynamic Friction.
-    A trade is only labeled as successful (1) if it hits the profit target AFTER 
-    paying the Corwin-Schultz/Roll bid-ask spread and the square-root market impact slippage.
-    """
+@cuda.jit(fastmath=True)
+def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_volumes, advs, labels, rr_ratio, max_hold_days):
+    i = cuda.grid(1)
     n = len(closes)
-    labels = np.zeros(n, dtype=np.int8)
     
-    for i in range(n - max_hold_days):
-        if np.isnan(atrs[i]) or np.isnan(spreads[i]) or advs[i] == 0:
-            continue
+    if i < n - max_hold_days:
+        if not (math.isnan(atrs[i]) or math.isnan(spreads[i]) or advs[i] == 0):
+            # 1. Estimate Entry Friction
+            vol_ratio = current_volumes[i] / advs[i]
+            entry_slippage = closes[i] * 0.001 * math.sqrt(vol_ratio)
+            entry_friction = (spreads[i] / 2.0) + entry_slippage
             
-        # 1. Estimate Entry Friction
-        vol_ratio = current_volumes[i] / advs[i]
-        entry_slippage = closes[i] * 0.001 * np.sqrt(vol_ratio) 
-        entry_friction = (spreads[i] / 2.0) + entry_slippage
-        
-        true_entry_price = closes[i] + entry_friction
-        stop_loss = true_entry_price - atrs[i]
-        take_profit = true_entry_price + (atrs[i] * rr_ratio)
-        
-        # 2. Path Simulation (Triple Barrier)
-        for j in range(i + 1, i + max_hold_days):
-            # Lower barrier hit -> Stop Loss Executed
-            if lows[j] <= stop_loss:
-                break
-                
-            # Upper barrier hit -> Must clear the exit friction to be truly profitable
-            exit_vol_ratio = current_volumes[j] / advs[j]
-            exit_friction = (spreads[j] / 2.0) + (closes[j] * 0.001 * np.sqrt(exit_vol_ratio))
+            true_entry_price = closes[i] + entry_friction
+            stop_loss = true_entry_price - atrs[i]
+            take_profit = true_entry_price + (atrs[i] * rr_ratio)
             
-            if (highs[j] - exit_friction) >= take_profit:
-                labels[i] = 1
-                break
+            # 2. Path Simulation
+            for j in range(i + 1, i + max_hold_days):
+                if lows[j] <= stop_loss:
+                    break
+                    
+                exit_vol_ratio = current_volumes[j] / advs[j]
+                exit_friction = (spreads[j] / 2.0) + (closes[j] * 0.001 * math.sqrt(exit_vol_ratio))
                 
-    return labels
+                if (highs[j] - exit_friction) >= take_profit:
+                    labels[i] = 1
+                    break
 
-def apply_institutional_labels(df: pd.DataFrame, rr_ratio: float = config.RR_RATIO, max_hold_days: int = config.MAX_HOLD_DAYS) -> pd.DataFrame:
-    df['target_label'] = _compute_friction_adjusted_labels(
-        df['close'].values, df['high'].values, df['low'].values, df['atr'].values, 
-        df['roll_spread'].values, df['volume'].values, df['adv_20'].values, 
-        rr_ratio, max_hold_days
-    )
-    return df
+@cuda.jit(fastmath=True)
+def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
+    i = cuda.grid(1)
+    n = len(closes)
+    
+    if i < n - dte:
+        if not math.isnan(atrs[i]) and atrs[i] > 0:
+            entry = closes[i]
+            target = entry + (atrs[i] * target_premium_gain)
+            stop = entry - atrs[i]
+            
+            for j in range(i + 1, i + dte):
+                if closes[j] <= stop:
+                    break
+                if closes[j] >= target:
+                    labels[i] = 1
+                    break
 
 # ==============================================================================
-# 3. DASK WORKER EXECUTION MAPPING
+# 2. DASK WORKER EXECUTION MAPPING
 # ==============================================================================
 
 def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Applies the massive institutional sensor suite to a localized data chunk.
-    Executed lazily inside Dask worker allocation threads.
+    Applies massive mechanical sensors to a localized data chunk using 
+    asynchronous CUDA kernel dispatches.
     """
     if df.empty or len(df) < 252:
         return pd.DataFrame(columns=df.columns)
         
     df.columns = [c.lower() for c in df.columns]
     
-    # 1. Base Analytics
+    # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
     
-    # 2. Market Microstructure & Liquidity
-    df['roll_spread'] = compute_roll_spread(df['close'].values, window=20)
-    df['amihud_illiq'] = compute_amihud_illiquidity(df['returns'].values, df['close'].values, df['volume'].values, window=20)
+    # Stage continuous NumPy arrays for GPU transfer
+    closes = np.ascontiguousarray(df['close'].values.astype(np.float64))
+    highs = np.ascontiguousarray(df['high'].values.astype(np.float64))
+    lows = np.ascontiguousarray(df['low'].values.astype(np.float64))
+    volumes = np.ascontiguousarray(df['volume'].values.astype(np.float64))
+    returns = np.ascontiguousarray(df['returns'].values.astype(np.float64))
+    atrs = np.ascontiguousarray(df['atr'].fillna(0).values.astype(np.float64))
+    advs = np.ascontiguousarray(df['adv_20'].fillna(0).values.astype(np.float64))
     
-    # 3. Crash Risk & Asymmetry
-    ncskew, duvol = compute_crash_risk(df['returns'].values, window=60)
-    df['ncskew'] = ncskew
-    df['duvol'] = duvol
+    n = len(closes)
     
-    # 4. Friction-Adjusted Labeling
+    # Initialize blank output arrays
+    spreads = np.zeros(n, dtype=np.float64)
+    amihud = np.zeros(n, dtype=np.float64)
+    ncskew = np.zeros(n, dtype=np.float64)
+    duvol = np.zeros(n, dtype=np.float64)
+    labels = np.zeros(n, dtype=np.int8)
+
+    # 1. PUSH MEMORY TO VRAM
+    d_closes = cuda.to_device(closes)
+    d_highs = cuda.to_device(highs)
+    d_lows = cuda.to_device(lows)
+    d_volumes = cuda.to_device(volumes)
+    d_returns = cuda.to_device(returns)
+    d_atrs = cuda.to_device(atrs)
+    d_advs = cuda.to_device(advs)
+    
+    d_spreads = cuda.to_device(spreads)
+    d_amihud = cuda.to_device(amihud)
+    d_ncskew = cuda.to_device(ncskew)
+    d_duvol = cuda.to_device(duvol)
+    d_labels = cuda.to_device(labels)
+
+    # 2. KERNEL THREAD CONFIGURATION
+    threads_per_block = 256
+    blocks_per_grid = math.ceil(n / threads_per_block)
+
+    # 3. DISPATCH ASYNCHRONOUS KERNELS
+    compute_roll_spread_cuda[blocks_per_grid, threads_per_block](d_closes, d_spreads, 20)
+    compute_amihud_illiquidity_cuda[blocks_per_grid, threads_per_block](d_returns, d_closes, d_volumes, d_amihud, 20)
+    compute_crash_risk_cuda[blocks_per_grid, threads_per_block](d_returns, d_ncskew, d_duvol, 60)
+    
+    # Synchronize to ensure the bid-ask spreads are fully calculated before running label friction logic
+    cuda.synchronize()
+
     if config.RUN_MODE == "STANDARD":
-        df = apply_institutional_labels(df)
-        
-    # Drop NaNs to protect XGBoost DMatrix creation
+        compute_friction_labels_cuda[blocks_per_grid, threads_per_block](
+            d_closes, d_highs, d_lows, d_atrs, d_spreads, d_volumes, d_advs, d_labels, 2.0, 20
+        )
+        df['target_label'] = d_labels.copy_to_host()
+    else:
+        compute_options_labels_cuda[blocks_per_grid, threads_per_block](
+            d_closes, d_atrs, d_labels, 21, 0.50
+        )
+        df['option_target_label'] = d_labels.copy_to_host()
+
+    # 4. PULL VRAM DATA BACK TO HOST RAM
+    df['roll_spread'] = d_spreads.copy_to_host()
+    df['amihud_illiq'] = d_amihud.copy_to_host()
+    df['ncskew'] = d_ncskew.copy_to_host()
+    df['duvol'] = d_duvol.copy_to_host()
+
     df = df.dropna()
     return df
 
 def compile_features_from_raw() -> None:
     """
     Orchestrates the offline Dask-powered transformation pipeline.
+    Reads partitioned raw data out-of-core, dispatches CUDA instructions, and flushes to vault.
     """
     if not os.path.exists(config.RAW_VAULT_DIR):
         logger.error("Raw storage vault missing. Run ingestion sequence first.")
         return
         
-    logger.info("Initiating offline Dask-powered feature compilation using institutional metrics...")
+    logger.info("Engaging CUDA FastMath compilation for institutional microstructure sensors...")
     reset_processed_vault()
 
     ddf = dd.read_parquet(config.RAW_VAULT_DIR, **config.DASK_READ_KWARGS)
-
-    # Apply the advanced processing map to each partition
+    
+    # Map the massive CUDA block to Dask partition paths
     ddf_processed = ddf.map_partitions(compute_partition_features)
 
     ddf_processed.to_parquet(
@@ -1385,7 +1536,7 @@ def compile_features_from_raw() -> None:
         partition_on=['sector'],
         write_metadata_file=False
     )
-    logger.info(f"Friction-adjusted matrices safely exported to {config.PROCESSED_VAULT_DIR}.")
+    logger.info(f"Friction-adjusted memory arrays safely exported to {config.PROCESSED_VAULT_DIR}.")
 
 --- FILE: ./prepare_for_notebook.py ---
 

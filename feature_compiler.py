@@ -91,31 +91,37 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.lower() for c in df.columns]
     
     # -------------------------------------------------------------------------
-    # MULTI-AGENT HANDOFF: CPU-Bound Asynchronous LLM Sentiment Batching
+    # STEP 1: BASE CPU ANALYTICS
     # -------------------------------------------------------------------------
-    if config.FUSION_ENABLED and 'raw_news_headline' in df.columns:
-        # FIX: Replaced synchronous pandas `.apply()` with an asynchronous event loop
-        # that fires multiple local LLM queries concurrently without blocking
-        sentiment_results = asyncio.run(process_llm_batch_async(df))
-        df['sentiment_score'] = np.array(sentiment_results, dtype=np.float32)
-
-    # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
     
-   # FIX: Purge NaNs prior to VRAM transfer to prevent IEEE-754 CUDA array poisoning
+    # -------------------------------------------------------------------------
+    # STEP 2: NaN PURGE
+    # -------------------------------------------------------------------------
+    # FIX: Purge NaNs BEFORE the LLM evaluation to prevent wasting API inference
+    # compute on lookback rows that will be deleted anyway.
     df = df.dropna()
-    
-    # Stage continuous NumPy arrays for GPU transfer
-    # FIX: Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
-    closes = np.ascontiguousarray(df['close'].to_numpy(dtype=np.float64, na_value=np.nan))
-    highs = np.ascontiguousarray(df['high'].to_numpy(dtype=np.float64, na_value=np.nan))
-    lows = np.ascontiguousarray(df['low'].to_numpy(dtype=np.float64, na_value=np.nan))
-    volumes = np.ascontiguousarray(df['volume'].to_numpy(dtype=np.float64, na_value=np.nan))
-    returns = np.ascontiguousarray(df['returns'].to_numpy(dtype=np.float64, na_value=np.nan))
-    atrs = np.ascontiguousarray(df['atr'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
-    advs = np.ascontiguousarray(df['adv_20'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
+
+    # -------------------------------------------------------------------------
+    # STEP 3: MULTI-AGENT HANDOFF: CPU-Bound Asynchronous LLM Sentiment
+    # -------------------------------------------------------------------------
+    if config.FUSION_ENABLED and 'raw_news_headline' in df.columns:
+        sentiment_results = asyncio.run(process_llm_batch_async(df))
+        df['sentiment_score'] = np.array(sentiment_results, dtype=np.float32)
+
+    # -------------------------------------------------------------------------
+    # STEP 4: VRAM MEMORY STAGING
+    # -------------------------------------------------------------------------
+    # Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
+    closes = np.ascontiguousarray(df['close'].to_numpy(dtype=np.float64))
+    highs = np.ascontiguousarray(df['high'].to_numpy(dtype=np.float64))
+    lows = np.ascontiguousarray(df['low'].to_numpy(dtype=np.float64))
+    volumes = np.ascontiguousarray(df['volume'].to_numpy(dtype=np.float64))
+    returns = np.ascontiguousarray(df['returns'].to_numpy(dtype=np.float64))
+    atrs = np.ascontiguousarray(df['atr'].to_numpy(dtype=np.float64))
+    advs = np.ascontiguousarray(df['adv_20'].to_numpy(dtype=np.float64))
     
     n = len(closes)
     

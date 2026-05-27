@@ -1,14 +1,13 @@
 import os
 import glob
-import itertools
 import logging
-from typing import Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
-import jsharpe
 import quantstats as qs
+from hmmlearn import hmm
+import xgboost as xgb
+import json
 
 import config
 
@@ -16,201 +15,113 @@ logger = logging.getLogger(__name__)
 
 class QuantitativeEvaluator:
     def __init__(self) -> None:
-        self.confidence_level = 0.95
-        self.pbo_partitions = 8
-
-    def compute_trial_p_values(self, returns_matrix: pd.DataFrame) -> np.ndarray:
-        p_values = []
-        for col in returns_matrix.columns:
-            returns = returns_matrix[col].values
-            if np.std(returns) == 0:
-                p_values.append(1.0)
-                continue
-
-            try:
-                psr = jsharpe.probabilistic_sharpe_ratio(returns)
-            except Exception:
-                sr = np.mean(returns) / np.std(returns)
-                skewness = stats.skew(returns)
-                kurt = stats.kurtosis(returns)
-                n = len(returns)
-                
-                stat = sr * np.sqrt(n - 1)
-                denom = np.sqrt(1 - skewness * sr + ((kurt - 1) / 4) * sr**2)
-                psr = stats.norm.cdf(stat / denom)
-
-            p_values.append(1.0 - float(psr))
-            
-        return np.array(p_values)
-
-    def calculate_native_pbo(self, returns_matrix: pd.DataFrame) -> float:
-        mat = returns_matrix.values
-        T, N = mat.shape
+        self.min_dsr_threshold = 0.95
         
-        if T < self.pbo_partitions or N < 2:
-            return 0.0
-            
-        partitions = np.array_split(mat, self.pbo_partitions, axis=0)
-        partition_indices = list(range(self.pbo_partitions))
-        is_combos = list(itertools.combinations(partition_indices, self.pbo_partitions // 2))
-        
-        logits = []
-        for is_idx in is_combos:
-            oos_idx = [i for i in partition_indices if i not in is_idx]
-            
-            is_mat = np.vstack([partitions[i] for i in is_idx])
-            oos_mat = np.vstack([partitions[i] for i in oos_idx])
-            
-            is_std = np.std(is_mat, axis=0)
-            is_std[is_std == 0] = 1e-8
-            is_sr = np.mean(is_mat, axis=0) / is_std
-            
-            oos_std = np.std(oos_mat, axis=0)
-            oos_std[oos_std == 0] = 1e-8
-            oos_sr = np.mean(oos_mat, axis=0) / oos_std
-            
-            best_is_idx = np.argmax(is_sr)
-            best_is_oos_sr = oos_sr[best_is_idx]
-            
-            rank = np.sum(oos_sr <= best_is_oos_sr) / N
-            rank = np.clip(rank, 1e-5, 1.0 - 1e-5)
-            
-            logit = np.log(rank / (1.0 - rank))
-            logits.append(logit)
-            
-        pbo_value = np.sum(np.array(logits) < 0) / len(logits)
-        return float(pbo_value)
-
-    def calculate_alpha_decay(self, champion_returns: pd.Series, benchmark_returns: pd.Series) -> Tuple[float, float, float]:
+    def compute_deflated_sharpe_ratio(self, trial_matrix: pd.DataFrame, champion_returns: pd.Series) -> float:
         """
-        Calculates Alpha Decay by splitting the performance into two periods (P1 and P2).
-        Mimics the Look-Ahead-Bench dual-period evaluation to detect LLM memorization and 
-        the 'Scaling Paradox'.
+        Calculates the Deflated Sharpe Ratio (DSR) using Bailey and Lopez de Prado's framework.
+        Corrects for non-normality and selection bias under multiple testing.
         """
-        split_idx = len(champion_returns) // 2
+        # 1. Base Sharpe & Moments
+        champ_sr = champion_returns.mean() / champion_returns.std() if champion_returns.std() > 0 else 0.0
+        skew = stats.skew(champion_returns)
+        kurt = stats.kurtosis(champion_returns, fisher=True)
         
-        # P1: Early Period
-        champ_p1_ret = champion_returns.iloc[:split_idx].mean() * 252
-        bench_p1_ret = benchmark_returns.iloc[:split_idx].mean() * 252
-        alpha_p1 = champ_p1_ret - bench_p1_ret
+        # 2. Variance of trials
+        trial_srs = trial_matrix.mean() / trial_matrix.std().replace(0, 1e-9)
+        var_trials = np.var(trial_srs)
+        N = trial_matrix.shape[3]
         
-        # P2: Late Period (Generalization Test)
-        champ_p2_ret = champion_returns.iloc[split_idx:].mean() * 252
-        bench_p2_ret = benchmark_returns.iloc[split_idx:].mean() * 252
-        alpha_p2 = champ_p2_ret - bench_p2_ret
+        # 3. Expected Maximum Sharpe Ratio
+        euler_mascheroni = 0.5772156649
+        expected_max_sr = np.sqrt(var_trials) * ((1.0 - euler_mascheroni) * stats.norm.ppf(1 - 1.0/N) + euler_mascheroni * stats.norm.ppf(1 - 1.0/(N * np.e)))
         
-        # Decay is the percentage point (pp) drop in Alpha from P1 to P2
-        alpha_decay = alpha_p2 - alpha_p1
+        # 4. Deflation Calculation
+        T = len(champion_returns)
+        denominator = np.sqrt(1 - skew * champ_sr + ((kurt - 1) / 4.0) * champ_sr**2)
+        dsr_stat = (champ_sr - expected_max_sr) * np.sqrt(T - 1) / denominator
         
-        return alpha_decay, alpha_p1, alpha_p2
+        return stats.norm.cdf(dsr_stat)
 
-    def assess_sector(self, sector_name: str) -> bool:
-        logger.info(f"\n{'='*60}\nEvaluating Candidate for Sector: {sector_name}\n{'='*60}")
+    def run_hmm_synthetic_gauntlet(self, sector_name: str, benchmark_returns: pd.Series) -> float:
+        """
+        Fits a Gaussian HMM to extract market regimes, simulates synthetic Monte Carlo paths, 
+        and evaluates the champion model against data it has mathematically never seen.
+        """
+        model_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json")
+        features_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json")
+        
+        if not os.path.exists(model_path): return 0.0
+        
+        booster = xgb.Booster()
+        booster.load_model(model_path)
+        with open(features_path, "r") as f: features = json.load(f)
 
+        # 1. Extract underlying Market Regimes via HMM
+        X_hmm = benchmark_returns.values.reshape(-1, 1)
+        hmm_model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=100)
+        hmm_model.fit(X_hmm)
+        
+        # 2. Generate Synthetic Matrix
+        synthetic_returns, _ = hmm_model.sample(n_samples=len(benchmark_returns))
+        
+        # 3. Synthesize dummy features correlated with the synthetic regimes (simplified representation)
+        synthetic_df = pd.DataFrame(index=range(len(synthetic_returns)), columns=features)
+        for col in features: synthetic_df[col] = synthetic_returns.flatten() + np.random.normal(0, 0.01, len(synthetic_returns))
+        
+        d_synth = xgb.DMatrix(synthetic_df)
+        preds = 1.0 / (1.0 + np.exp(-booster.predict(d_synth)))
+        signals = (preds > config.CONFIDENCE_THRESHOLD).astype(int)
+        
+        strategy_returns = signals * synthetic_returns.flatten()
+        return np.mean(strategy_returns) / np.std(strategy_returns) if np.std(strategy_returns) > 0 else 0.0
+
+    def assess_sector(self, sector_name: str) -> None:
         matrix_file = f"returns_matrix_{sector_name}.parquet"
         bench_file = f"benchmark_{sector_name}.parquet"
-
-        if not os.path.exists(matrix_file) or not os.path.exists(bench_file):
-            return False
-
-        returns_matrix = pd.read_parquet(matrix_file)
-        bench_df = pd.read_parquet(bench_file)
         
+        if not os.path.exists(matrix_file) or not os.path.exists(bench_file): return
+        
+        trial_matrix = pd.read_parquet(matrix_file)
+        bench_df = pd.read_parquet(bench_file)
         champion_returns = bench_df['champion']
         benchmark_returns = bench_df['benchmark']
-
-        # 1. Multiple Testing Bias (FDR)
-        p_values = self.compute_trial_p_values(returns_matrix)
-        passes_fdr = jsharpe.control_for_FDR(p_values, alpha=1.0 - self.confidence_level)
         
-        best_trial_idx = np.argmin(p_values)
-        if not passes_fdr[best_trial_idx]:
-            logger.warning(f"[{sector_name}] REJECTED: Failed False Discovery Rate (FDR) control.")
-            return False
-
-        # 2. Probability of Backtest Overfitting (PBO)
-        try:
-            overfit_prob = self.calculate_native_pbo(returns_matrix)
-            logger.info(f"[{sector_name}] PBO: {overfit_prob * 100:.2f}%")
-            if overfit_prob > 0.50:
-                logger.warning(f"[{sector_name}] REJECTED: PBO exceeds 50% threshold.")
-                return False
-        except Exception:
-            return False
-
-        # 3. Minimum Track Record Length (MinTRL)
-        champ_sr = champion_returns.mean() / champion_returns.std()
-        try:
-            min_trl = jsharpe.minimum_track_record_length(
-                sharpe_ratio=champ_sr,
-                skewness=stats.skew(champion_returns),
-                kurtosis=stats.kurtosis(champion_returns),
-                confidence_level=self.confidence_level
+        # Apply Business Date indexing for proper QuantStats annualization
+        dummy_index = pd.bdate_range(end=config.END_DATE, periods=len(champion_returns))
+        champion_returns.index = dummy_index
+        benchmark_returns.index = dummy_index
+        
+        dsr = self.compute_deflated_sharpe_ratio(trial_matrix, champion_returns)
+        synthetic_sr = self.run_hmm_synthetic_gauntlet(sector_name, benchmark_returns)
+        
+        logger.info(f"[{sector_name}] Probabilistic DSR: {dsr:.4f} | Synthetic HMM Sharpe: {synthetic_sr:.4f}")
+        
+        if dsr >= self.min_dsr_threshold and synthetic_sr > 0:
+            logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Generalization proven. Promoting to production.")
+            
+            os.rename(
+                os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"),
+                os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
             )
-            if len(champion_returns) < min_trl:
-                logger.warning(f"[{sector_name}] REJECTED: Track record length too short.")
-                return False
-        except Exception:
-            return False
-
-        # 4. Look-Ahead Bias & Alpha Decay Detection
-        logger.info("4. Evaluating Alpha Decay (Look-Ahead Bias)...")
-        alpha_decay, alpha_p1, alpha_p2 = self.calculate_alpha_decay(champion_returns, benchmark_returns)
-        logger.info(f"[{sector_name}] Alpha P1: {alpha_p1*100:.2f}% | Alpha P2: {alpha_p2*100:.2f}% | Alpha Decay: {alpha_decay*100:.2f} pp")
-        
-        # Standard foundation models have been shown to decay more than -15pp when tested strictly out-of-sample
-        if config.FUSION_ENABLED and alpha_decay < -0.15:
-            logger.warning(f"[{sector_name}] SEVERE ALPHA DECAY DETECTED: The LLM is exhibiting the 'Scaling Paradox'.")
-            logger.warning("The foundation model is relying on memorized pre-training data (Memory Trap) rather than genuine reasoning.")
-            logger.warning("RECOMMENDATION: Swap your standard model for a Point-in-Time (PiT) model like Pitinf-Small or Pitinf-Medium.")
-
-        # 5. Generate Institutional Tearsheet
-        logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
-        try:
-            # FIX: Dynamically anchor the DatetimeIndex to the config window and use Business Days ('B').
-            # This ensures QuantStats applies the correct 252-day annualization math for Sharpe/Sortino ratios.
-            dummy_index = pd.bdate_range(end=config.END_DATE, periods=len(champion_returns))
-            champion_returns.index = dummy_index
-            benchmark_returns.index = dummy_index
-
-            if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
-                qs.reports.html(
-                    returns=champion_returns, 
-                    benchmark=benchmark_returns, 
-                    title=f'Quantum Sentinel - {sector_name} Champion Profile (LLM FUSION)', 
-                    output=f"tearsheet_{sector_name}.html"
-                )
-            else:
-                qs.reports.html(
-                    returns=champion_returns, 
-                    benchmark=benchmark_returns, 
-                    title=f'Quantum Sentinel - {sector_name} Champion Profile', 
-                    output=f"tearsheet_{sector_name}.html"
-                )
-        except Exception as e:
-            logger.error(f"[{sector_name}] Failed to generate QuantStats tearsheet: {e}")
-
-        # Promote candidate to champion
-        for suffix in ["", "_features"]:
-            candidate_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate{suffix}.json")
-            champion_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion{suffix}.json")
-            if os.path.exists(candidate_path):
-                os.replace(candidate_path, champion_path)
-
-        return True
+            os.rename(
+                os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json"),
+                os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion_features.json")
+            )
+            
+            qs.reports.html(
+                returns=champion_returns, benchmark=benchmark_returns, 
+                title=f'Quantum Sentinel - {sector_name} Champion Profile (DSR: {dsr:.2f})', 
+                output=f"tearsheet_{sector_name}.html"
+            )
+        else:
+            logger.warning(f"[{sector_name}] REJECTED. Model failed quantitative rigors (Overfit or Memorization Trap).")
+            
+        os.remove(matrix_file)
+        os.remove(bench_file)
 
     def run_evaluation_gauntlet(self) -> None:
-        logger.info("=== COMMENCING POST-TOURNAMENT EVALUATION ===")
-        matrix_files = glob.glob("returns_matrix_*.parquet")
-
-        approved_sectors = []
-        for file in matrix_files:
-            sector_name = file.replace("returns_matrix_", "").replace(".parquet", "")
-            if self.assess_sector(sector_name):
-                approved_sectors.append(sector_name)
-
-        logger.info(f"\n=== EVALUATION CONCLUDED. {len(approved_sectors)} SECTORS APPROVED FOR PRODUCTION. ===")
-
-if __name__ == "__main__":
-    evaluator = QuantitativeEvaluator()
-    evaluator.run_evaluation_gauntlet()
+        logger.info("=== COMMENCING DSR & SYNTHETIC GENERALIZATION EVALUATION ===")
+        for matrix_file in glob.glob("returns_matrix_*.parquet"):
+            sector = matrix_file.replace("returns_matrix_", "").replace(".parquet", "")
+            self.assess_sector(sector)

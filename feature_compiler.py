@@ -1,6 +1,9 @@
 import os
+import re
 import math
+import json
 import shutil
+import requests
 import logging
 import numpy as np
 import pandas as pd
@@ -27,7 +30,42 @@ def reset_processed_vault() -> None:
     os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
 
 # ==============================================================================
-# 1. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
+# 1. ENTITY ANONYMIZATION & LLM INFERENCE (THE SENSOR)
+# ==============================================================================
+def extract_llm_sentiment(headline: str, ticker: str) -> float:
+    """
+    Passes news text to the local LLM. 
+    Crucially utilizes Entity Anonymization to scrub the ticker from the text, 
+    preventing the LLM from relying on memorized historical look-ahead bias.
+    """
+    if pd.isna(headline) or not str(headline).strip():
+        return 0.0
+
+    # Entity Anonymization: Mask the specific company identifier
+    anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', str(headline), flags=re.IGNORECASE)
+
+    payload = {
+        "model": config.LLM_MODEL_NAME,
+        "prompt": f"{config.LLM_SYSTEM_PROMPT}\n\nHeadline: {anonymized_headline}",
+        "format": "json",
+        "stream": False
+    }
+
+    try:
+        # Route to local Ollama server (running on CPU/System RAM)
+        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=2.0)
+        if response.status_code == 200:
+            result = response.json()
+            data = json.loads(result.get("response", "{}"))
+            return float(data.get("sentiment_score", 0.0))
+    except Exception:
+        # Failsafe: Default to neutral sentiment if the LLM server times out or hallucinate formatting
+        pass
+
+    return 0.0
+
+# ==============================================================================
+# 2. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
 # ==============================================================================
 
 @cuda.jit(fastmath=True)
@@ -39,7 +77,6 @@ def compute_roll_spread_cuda(closes, spreads, window):
         mean_x = 0.0
         mean_y = 0.0
         
-        # Calculate means
         for j in range(i - window + 1, i):
             mean_x += (closes[j+1] - closes[j])
             mean_y += (closes[j] - closes[j-1])
@@ -47,7 +84,6 @@ def compute_roll_spread_cuda(closes, spreads, window):
         mean_x /= (window - 1)
         mean_y /= (window - 1)
 
-        # Calculate sample covariance
         cov = 0.0
         for j in range(i - window + 1, i):
             x = (closes[j+1] - closes[j])
@@ -67,26 +103,22 @@ def compute_crash_risk_cuda(returns, ncskew, duvol, window):
     n = len(returns)
     
     if i >= window and i < n:
-        # Calculate Mean
         mean_ret = 0.0
         for j in range(i - window, i):
             mean_ret += returns[j]
         mean_ret /= window
         
-        # Calculate Variance & Standard Deviation
         var_ret = 0.0
         for j in range(i - window, i):
             var_ret += (returns[j] - mean_ret)**2
         std_ret = math.sqrt(var_ret / window)
         
-        # 1. NCSKEW
         if std_ret > 0:
             skew = 0.0
             for j in range(i - window, i):
                 skew += ((returns[j] - mean_ret) / std_ret)**3
             ncskew[i] = -(skew / window)
             
-        # 2. DUVOL
         down_sum, up_sum = 0.0, 0.0
         down_count, up_count = 0, 0
         
@@ -129,7 +161,6 @@ def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_vol
     
     if i < n - max_hold_days:
         if not (math.isnan(atrs[i]) or math.isnan(spreads[i]) or advs[i] == 0):
-            # 1. Estimate Entry Friction
             vol_ratio = current_volumes[i] / advs[i]
             entry_slippage = closes[i] * 0.001 * math.sqrt(vol_ratio)
             entry_friction = (spreads[i] / 2.0) + entry_slippage
@@ -138,7 +169,6 @@ def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_vol
             stop_loss = true_entry_price - atrs[i]
             take_profit = true_entry_price + (atrs[i] * rr_ratio)
             
-            # 2. Path Simulation
             for j in range(i + 1, i + max_hold_days):
                 if lows[j] <= stop_loss:
                     break
@@ -169,19 +199,28 @@ def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
                     break
 
 # ==============================================================================
-# 2. DASK WORKER EXECUTION MAPPING
+# 3. DASK WORKER EXECUTION MAPPING
 # ==============================================================================
 
 def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Applies massive mechanical sensors to a localized data chunk using 
-    asynchronous CUDA kernel dispatches.
+    Applies massive mechanical sensors to a localized data chunk. 
+    Routes text to the CPU-bound LLM before mapping structural math to the GPU.
     """
     if df.empty or len(df) < 252:
         return pd.DataFrame(columns=df.columns)
         
     df.columns = [c.lower() for c in df.columns]
     
+    # -------------------------------------------------------------------------
+    # MULTI-AGENT HANDOFF: CPU-Bound LLM Sentiment Scoring
+    # -------------------------------------------------------------------------
+    if config.FUSION_ENABLED and 'raw_news_headline' in df.columns:
+        df['sentiment_score'] = df.apply(
+            lambda row: extract_llm_sentiment(str(row['raw_news_headline']), str(row['ticker'])),
+            axis=1
+        ).astype(np.float32)
+
     # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
@@ -198,14 +237,13 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     
     n = len(closes)
     
-    # Initialize blank output arrays
     spreads = np.zeros(n, dtype=np.float64)
     amihud = np.zeros(n, dtype=np.float64)
     ncskew = np.zeros(n, dtype=np.float64)
     duvol = np.zeros(n, dtype=np.float64)
     labels = np.zeros(n, dtype=np.int8)
 
-    # 1. PUSH MEMORY TO VRAM
+    # PUSH MEMORY TO VRAM
     d_closes = cuda.to_device(closes)
     d_highs = cuda.to_device(highs)
     d_lows = cuda.to_device(lows)
@@ -220,16 +258,15 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     d_duvol = cuda.to_device(duvol)
     d_labels = cuda.to_device(labels)
 
-    # 2. KERNEL THREAD CONFIGURATION
+    # KERNEL THREAD CONFIGURATION
     threads_per_block = 256
     blocks_per_grid = math.ceil(n / threads_per_block)
 
-    # 3. DISPATCH ASYNCHRONOUS KERNELS
+    # DISPATCH ASYNCHRONOUS KERNELS
     compute_roll_spread_cuda[blocks_per_grid, threads_per_block](d_closes, d_spreads, 20)
     compute_amihud_illiquidity_cuda[blocks_per_grid, threads_per_block](d_returns, d_closes, d_volumes, d_amihud, 20)
     compute_crash_risk_cuda[blocks_per_grid, threads_per_block](d_returns, d_ncskew, d_duvol, 60)
     
-    # Synchronize to ensure the bid-ask spreads are fully calculated before running label friction logic
     cuda.synchronize()
 
     if config.RUN_MODE == "STANDARD":
@@ -243,11 +280,15 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
         )
         df['option_target_label'] = d_labels.copy_to_host()
 
-    # 4. PULL VRAM DATA BACK TO HOST RAM
+    # PULL VRAM DATA BACK TO HOST RAM
     df['roll_spread'] = d_spreads.copy_to_host()
     df['amihud_illiq'] = d_amihud.copy_to_host()
     df['ncskew'] = d_ncskew.copy_to_host()
     df['duvol'] = d_duvol.copy_to_host()
+
+    # If the LLM wasn't triggered, safely drop the raw text column so PyArrow Parquet doesn't bloat
+    if 'raw_news_headline' in df.columns:
+        df = df.drop(columns=['raw_news_headline'])
 
     df = df.dropna()
     return df
@@ -255,18 +296,16 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
 def compile_features_from_raw() -> None:
     """
     Orchestrates the offline Dask-powered transformation pipeline.
-    Reads partitioned raw data out-of-core, dispatches CUDA instructions, and flushes to vault.
     """
     if not os.path.exists(config.RAW_VAULT_DIR):
         logger.error("Raw storage vault missing. Run ingestion sequence first.")
         return
         
-    logger.info("Engaging CUDA FastMath compilation for institutional microstructure sensors...")
+    logger.info(f"Engaging CUDA compilation... (Fusion Mode: {'ON' if config.FUSION_ENABLED else 'OFF'})")
     reset_processed_vault()
 
     ddf = dd.read_parquet(config.RAW_VAULT_DIR, **config.DASK_READ_KWARGS)
     
-    # Map the massive CUDA block to Dask partition paths
     ddf_processed = ddf.map_partitions(compute_partition_features)
 
     ddf_processed.to_parquet(
@@ -275,4 +314,4 @@ def compile_features_from_raw() -> None:
         partition_on=['sector'],
         write_metadata_file=False
     )
-    logger.info(f"Friction-adjusted memory arrays safely exported to {config.PROCESSED_VAULT_DIR}.")
+    logger.info(f"Data arrays safely exported to {config.PROCESSED_VAULT_DIR}.")

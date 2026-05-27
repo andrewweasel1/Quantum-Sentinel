@@ -1,28 +1,32 @@
-# Core Data & Performance
-pandas
+# ==========================================
+# QUANTUM SENTINEL V6 - MULTI-AGENT STACK
+# ==========================================
+
+# Core Data & Mathematics
 numpy
+pandas
 scipy
+
+# Out-of-Core Processing & Zero-Copy Memory
 dask[dataframe]
-pyarrow>=10.0.0
-numba
+pyarrow
 
-# Machine Learning & Indicators
+# Machine Learning & Microstructure Sensors
 xgboost
+numba
+tbb
 pandas_ta
-scikit-learn
 
-# Institutional Quantitative Metrics
+# Institutional Quantitative Evaluation
 jsharpe
 quantstats
 statsmodels>=0.13.0
-joblib
-seaborn
 
-# Execution & Telemetry
-alpaca-py
+# Data Acquisition & Broker Routing
 yfinance
 requests
+alpaca-py
 
-# Dashboard & Visualization
+# Telemetry & Dashboard Interface
 streamlit
 plotly

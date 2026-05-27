@@ -1,71 +1,82 @@
+import os
 import argparse
 import logging
-import config
+import pandas as pd
 
 # ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
+# 1. ARGPARSE & GLOBAL STATE INJECTION
+# ==============================================================================
+parser = argparse.ArgumentParser(description="Quantum Sentinel V6 - Multi-Agent Engine")
+parser.add_argument("--refresh-raw", action="store_true", help="Refresh raw market data")
+parser.add_argument("--fusion", action="store_true", help="Enable LLM Sentiment Fusion Agent")
+parser.add_argument("--disable-risk-manager", action="store_true", help="Disable the Risk Manager Agent")
+
+# New Lifecycle Execution Flags
+parser.add_argument("--evaluate", action="store_true", help="Run the statistical Evaluator to promote models")
+parser.add_argument("--live", action="store_true", help="Launch the Live Trading Sandbox")
+args = parser.parse_args()
+
+# Inject the toggled states into config BEFORE other modules load
+import config
+config.FUSION_ENABLED = args.fusion
+config.RISK_MANAGER_ENABLED = not args.disable_risk_manager
+
+# ==============================================================================
+# 2. CENTRALIZED LOGGING CONFIGURATION
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
-        logging.StreamHandler()                       # Prints to console
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  
+        logging.StreamHandler()                       
     ]
 )
-# FIXED: Corrected dunder method from **name** to __name__
 logger = logging.getLogger(__name__)
 
-# Import custom modules AFTER logging is configured so they inherit the root logger
+# ==============================================================================
+# 3. DOWNSTREAM MODULE IMPORTS
+# ==============================================================================
 import data_ingestion
 import feature_compiler
 import tournament
+import evaluator
+import live_trader
 
 def main():
     logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
+    logger.info(f"LLM Fusion Agent: {'ONLINE' if config.FUSION_ENABLED else 'OFFLINE'}")
+    logger.info(f"Risk Manager Agent: {'ONLINE' if config.RISK_MANAGER_ENABLED else 'OFFLINE'}")
     
-    # Set up command-line arguments
-    parser = argparse.ArgumentParser(description="AI Quantitative Strategy Tournament Runner")
-    parser.add_argument(
-        "--refresh-raw", 
-        action="store_true", 
-        help="Force a point-in-time constituent refresh and clean re-download of all raw daily data"
-    )
-    parser.add_argument(
-        "--refresh-features", 
-        action="store_true", 
-        help="Force offline Dask re-compilation of technical indicator feature matrices"
-    )
-    args = parser.parse_args()
-
-    # ==============================================================================
-    # PHASE 1: RAW DATA INGESTION
-    # ==============================================================================
+    # PHASE 1: DATA PIPELINE & TRAINING
     if args.refresh_raw:
-        logger.info("[COMMAND] --refresh-raw detected. Synchronizing raw market data...")
-        # Retrieves the survivorship-bias free universe map
         universe = data_ingestion.get_survivorship_adjusted_universe()
-        # Multi-threaded download into the raw Parquet vault
         data_ingestion.build_raw_vault(universe)
-        
-        # If raw data is refreshed, we must automatically recompile the downstream features
-        args.refresh_features = True
-
-    # ==============================================================================
-    # PHASE 2: OFFLINE FEATURE COMPILATION
-    # ==============================================================================
-    if args.refresh_features:
-        logger.info("[COMMAND] --refresh-features detected. Compiling offline indicator matrices...")
-        # Maps partitions via Dask and dumps to the processed Hive-partitioned vault
         feature_compiler.compile_features_from_raw()
+        
+        director = tournament.ModularTournamentDirector()
+        director.execute_gauntlet()
 
-    # ==============================================================================
-    # PHASE 3: OUT-OF-CORE MACHINE LEARNING TOURNAMENT
-    # ==============================================================================
-    logger.info("[COMMAND] Initializing XGBoost Out-of-Core Tournament...")
-    director = tournament.ModularTournamentDirector()
-    director.execute_gauntlet()
+    # PHASE 2: STATISTICAL EVALUATION
+    if args.evaluate:
+        stat_evaluator = evaluator.QuantitativeEvaluator()
+        stat_evaluator.run_evaluation_gauntlet()
 
-# FIXED: Corrected dunder method from **name** == "**main**" to standard execution gate
+    # PHASE 3: LIVE MARKET EXECUTION
+    if args.live:
+        logger.info("Initializing Live Trading Sandbox via Alpaca...")
+        sandbox = live_trader.LiveTradingSandbox(is_paper=True)
+        
+        # In a true deployment, this block would pull today's live OHLCV data. 
+        # For testing, we load the most recent data from the processed vault.
+        logger.info("Sourcing live market data for active champions...")
+        live_market_df = pd.read_parquet(config.PROCESSED_VAULT_DIR, engine="pyarrow")
+        
+        # Filter for the most recent trading day to simulate the live feed
+        latest_date = live_market_df['date'].max()
+        current_data = live_market_df[live_market_df['date'] == latest_date].copy()
+        
+        sandbox.execute_live_cycle(current_data)
+
 if __name__ == "__main__":
     main()

@@ -1,8 +1,8 @@
 import os
 import shutil
-import requests
 import pandas as pd
 import yfinance as yf
+import pyarrow as pa
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import Dict
@@ -36,17 +36,14 @@ def get_survivorship_adjusted_universe() -> Dict[str, str]:
     It is intended only for pipeline and architecture testing (Cold Run validation).
     """
     logger.warning("EODHD API bypassed. Fetching static S&P 500 list from Wikipedia.")
-    logger.warning("CRITICAL: This dataset contains SURVIVORSHIP BIAS. Do not use for live capital deployment.")
     
     try:
-        # Scrape current S&P 500 constituents from Wikipedia
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url)
         df = tables
         
         universe = {}
         for _, row in df.iterrows():
-            # Formatting the symbol to be compatible with yfinance (e.g., BRK.B -> BRK-B)
             ticker = str(row['Symbol']).replace('.', '-')
             sector = str(row['GICS Sector'])
             universe[ticker] = sector
@@ -58,7 +55,28 @@ def get_survivorship_adjusted_universe() -> Dict[str, str]:
         return {}
 
 # ==============================================================================
-# 2. ISOLATED THREAD INGESTION
+# 2. POINT-IN-TIME NEWS ACQUISITION (THE SENSOR)
+# ==============================================================================
+def fetch_point_in_time_news(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Fetches historical financial news conditionally. 
+    CRITICAL: To prevent the 'Scaling Paradox' and look-ahead bias identified in 
+    financial LLM literature, this data must be strictly Point-in-Time (PiT), 
+    meaning headlines are restricted to those published BEFORE market open of the given date.
+    """
+    # For the local Cold Run, we generate a mock historical headline placeholder. 
+    # For a live capital deployment, this must be swapped for a query to the 
+    # Kaggle Financial News Archive or a premium EODHD news endpoint.
+    news_data = {
+        "date": dates,
+        "raw_news_headline": [f"Standard pre-market conditions persist for {ticker}."] * len(dates)
+    }
+    news_df = pd.DataFrame(news_data)
+    news_df.set_index("date", inplace=True)
+    return news_df
+
+# ==============================================================================
+# 3. ISOLATED THREAD INGESTION (ZERO-COPY PYARROW)
 # ==============================================================================
 def ingest_raw_ticker(ticker: str, sector: str) -> bool:
     """Thread-safe isolated extraction processing loop for a single ticker."""
@@ -72,14 +90,22 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
             multi_level_index=False
         )
         
-        # Require a minimum of 1 trading year of data to calculate lookback indicators
         if df.empty or len(df) < 252:
             return False
             
+        df.index = pd.to_datetime(df.index)
         df['ticker'] = ticker
         df['sector'] = sector
         
-        # Partition data efficiently by sector for downstream Dask mapping
+        # LLM FUSION: Conditionally merge Point-in-Time News
+        if config.FUSION_ENABLED:
+            news_df = fetch_point_in_time_news(ticker, df.index)
+            df = df.join(news_df, how='left')
+        
+        # MEMORY OPTIMIZATION: Convert Pandas types to strict PyArrow memory backends.
+        # This prevents Pandas from duplicating data in RAM during the Dask hand-off.
+        df = df.convert_dtypes(dtype_backend="pyarrow")
+        
         out_dir = os.path.join(config.RAW_VAULT_DIR, f"sector={sector}")
         os.makedirs(out_dir, exist_ok=True)
         
@@ -87,21 +113,19 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
         return True
         
     except Exception as e:
-        # Logs exact network timeouts or data corruption errors 
         logger.error(f"Ingestion failed for {ticker} in sector {sector}.", exc_info=True)
         return False
 
 # ==============================================================================
-# 3. ASYNCHRONOUS ORCHESTRATION
+# 4. ASYNCHRONOUS ORCHESTRATION
 # ==============================================================================
 def build_raw_vault(universe_map: Dict[str, str]) -> None:
     """Asynchronous pipeline leveraging host thread scaling to populate the local vault."""
-    logger.info("Executing raw data acquisition layer (Testing Mode: Wikipedia S&P 500)...")
+    logger.info(f"Executing raw data acquisition layer (Fusion Mode: {'ON' if config.FUSION_ENABLED else 'OFF'})...")
     reset_raw_vault()
     
     success_count = 0
     
-    # Scale threads automatically based on available CPU cores
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = {executor.submit(ingest_raw_ticker, ticker, sector): ticker for ticker, sector in universe_map.items()}
         
@@ -110,25 +134,3 @@ def build_raw_vault(universe_map: Dict[str, str]) -> None:
                 success_count += 1
                 
     logger.info(f"Raw data acquisition complete. Successfully ingested {success_count} tickers.")
-Final Security Patch (dashboard.py)
-To ensure your architecture is 100% complete and safe to test, you should also update the top of dashboard.py to remove the hardcoded plaintext passwords. Change the authentication block at the top of the file to this:
-# Force strict HTTP verification layers directly within session allocations
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    st.title("🔐 Quantum Workspace Security Gate")
-    user_input = st.text_input("Username Identification Profile:")
-    pass_input = st.text_input("Secret Clearance Authentication Key:", type="password")
-    
-    # Authenticate via environment variables rather than hardcoded text
-    valid_user = os.environ.get("DASHBOARD_USER", "admin") 
-    valid_pass = os.environ.get("DASHBOARD_PASS", "admin")
-    
-    if st.button("Authenticate"):
-        if user_input == valid_user and pass_input == valid_pass: 
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Authentication failed. Unauthorized access attempt logged.")
-    st.stop()

@@ -18,9 +18,11 @@ tbb
 pandas_ta
 
 # Institutional Quantitative Evaluation
-jsharpe
-quantstats
-statsmodels>=0.13.0
+jsharpe          # Required for Bailey and Lopez de Prado's Deflated Sharpe Ratio [1, 2]
+hmmlearn         # Required for the Gaussian Hidden Markov Model synthesis
+scipy            # Required for Ward linkage and Spearman rank-order clustering
+nest_asyncio     # Required to prevent Dask worker event loop collisions
+quantstats       # Required for HTML tearsheet generation
 
 # Data Acquisition & Broker Routing
 yfinance

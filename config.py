@@ -1,6 +1,9 @@
 import os
 import argparse
 import logging
+import psutil
+import pyarrow as pa
+from datetime import datetime, timedelta
 import pandas as pd
 
 # ==============================================================================
@@ -72,6 +75,29 @@ def main():
         current_data = live_market_df[live_market_df['date'] == latest_date].copy()
         
         sandbox.execute_live_cycle(current_data)
+
+# ==============================================================================
+# 6. DYNAMIC HARDWARE ALLOCATION & OUT-OF-CORE CONFIGURATION
+# ==============================================================================
+# Dynamically scale data chunks based on available physical RAM
+SYSTEM_RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
+
+if SYSTEM_RAM_GB <= 16.0:
+    PARQUET_BLOCKSIZE = "64MiB"
+    ROW_GROUP_SIZE = 50000        # Smaller chunks, slows execution but guarantees safety
+elif SYSTEM_RAM_GB <= 32.0:
+    PARQUET_BLOCKSIZE = "128MiB"
+    ROW_GROUP_SIZE = 100000
+else:
+    PARQUET_BLOCKSIZE = "256MiB"
+    ROW_GROUP_SIZE = 250000       # Maximum throughput for High-Performance Workstations
+
+DASK_READ_KWARGS = {
+    "engine": "pyarrow",
+    "blocksize": PARQUET_BLOCKSIZE,
+    "split_row_groups": "infer",
+    "dtype_backend": "pyarrow"  
+}
 
 if __name__ == "__main__":
     main()

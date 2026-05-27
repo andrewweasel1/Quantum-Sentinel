@@ -44,8 +44,7 @@ def fetch_live_sentiment(ticker: str) -> float:
 # ==============================================================================
 logger = logging.getLogger(__name__)
 
-# Force Numba to use Intel TBB for ultra-fast, fork-safe CPU parallelization
-numba_config.THREADING_LAYER = 'tbb'
+# FIX: Delete the orphaned numba_config.THREADING_LAYER = 'tbb'
 
 # ==============================================================================
 # 1. THE SENSOR AGENT: LIVE LLM SENTIMENT

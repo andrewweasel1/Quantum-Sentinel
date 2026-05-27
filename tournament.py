@@ -134,11 +134,20 @@ class ModularTournamentDirector:
             
             try:
                 for train_df, test_df in self.generate_cpcv_splits(sector_df):
-                    train_df.to_parquet(temp_train_path, engine='pyarrow', row_group_size=100000)
+                    # FIX 1: Dynamically size the disk chunks based on hardware limits
+                    train_df.to_parquet(
+                        temp_train_path, 
+                        engine='pyarrow', 
+                        row_group_size=config.ROW_GROUP_SIZE 
+                    )
                     train_iter = ParquetDataIter(temp_train_path, features, target_col)
-                    dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
                     
-                    # Test DMatrix materialized in RAM to prevent IO thrashing
+                    # FIX 2: Enable Adaptive VRAM Caching to prevent CUDA OOM on smaller GPUs
+                    # cache_host_ratio=0.75 forces XGBoost to keep 75% of the histogram cache in RAM,
+                    # prioritizing structural safety and continuous execution over pure VRAM speed.
+                    dtrain = xgb.ExtMemQuantileDMatrix(train_iter, cache_host_ratio=0.75) 
+                    
+                    # Materialize the smaller test split directly into host RAM
                     dtest = xgb.DMatrix(test_df[features], label=test_df[target_col])
                     
                     bst = xgb.train(

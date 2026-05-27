@@ -2,6 +2,7 @@ import os
 import argparse
 import logging
 import pandas as pd
+from dask.distributed import Client, LocalCluster
 
 # ==============================================================================
 # 1. ARGPARSE & GLOBAL STATE INJECTION
@@ -43,7 +44,23 @@ import tournament
 import evaluator
 import live_trader
 
+def initialize_dask_cluster() -> Client:
+    """
+    Initializes a dynamic Dask cluster. Reserves cores for the LLM/GPU orchestrators 
+    and enforces strict memory limits to trigger graceful NVMe disk spilling on low RAM.
+    """
+    allocated_workers = max(1, os.cpu_count() - 2)
+    
+    cluster = LocalCluster(
+        n_workers=allocated_workers,
+        threads_per_worker=1,
+        memory_limit='auto'  # Guarantees the system slows down (spills) instead of crashing
+    )
+    return Client(cluster)
+
 def main():
+    client = initialize_dask_cluster()
+
     logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
     logger.info(f"LLM Fusion Agent: {'ONLINE' if config.FUSION_ENABLED else 'OFFLINE'}")
     logger.info(f"Risk Manager Agent: {'ONLINE' if config.RISK_MANAGER_ENABLED else 'OFFLINE'}")

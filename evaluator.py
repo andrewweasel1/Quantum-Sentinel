@@ -62,12 +62,14 @@ class QuantitativeEvaluator:
         hmm_model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=100)
         hmm_model.fit(X_hmm)
         
-        # 2. Generate Synthetic Matrix
+        # 2. Generate Synthetic Returns Matrix
         synthetic_returns, _ = hmm_model.sample(n_samples=len(benchmark_returns))
         
-        # 3. Synthesize dummy features correlated with the synthetic regimes (simplified representation)
-        synthetic_df = pd.DataFrame(index=range(len(synthetic_returns)), columns=features)
-        for col in features: synthetic_df[col] = synthetic_returns.flatten() + np.random.normal(0, 0.01, len(synthetic_returns))
+        # 3. FIX: Eliminate Target Leakage via Historical Feature Bootstrapping
+        # We randomly sample rows from the historical features (with replacement) to match 
+        # the length of the synthetic returns, destroying any chronological look-ahead bias.
+        historical_features_df = pd.read_parquet(config.PROCESSED_VAULT_DIR, columns=features)
+        synthetic_df = historical_features_df.sample(n=len(synthetic_returns), replace=True).reset_index(drop=True)
         
         d_synth = xgb.DMatrix(synthetic_df)
         preds = 1.0 / (1.0 + np.exp(-booster.predict(d_synth)))

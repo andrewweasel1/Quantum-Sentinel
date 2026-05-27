@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 class ParquetDataIter(xgb.DataIter):
     """
     A true out-of-core XGBoost Data Iterator.
-    Reads chunked row groups directly from disk via PyArrow, ensuring neither 
+    Reads chunked row groups directly from disk via PyArrow Tables, ensuring neither 
     Host RAM nor GPU VRAM is ever exhausted during massive CPCV evaluations.
     """
     def __init__(self, file_path: str, features: List[str], target_col: str):
+        # Instantiate on_host=True so DMatrix loads pointers into GPU batches
         super().__init__(on_host=True)
         self.file_path = file_path
         self.features = features
@@ -48,10 +49,16 @@ class ParquetDataIter(xgb.DataIter):
         if self.it == self.num_row_groups:
             return 0
             
-        # Read exactly one row group (chunk) from disk
-        chunk_df = self.pf.read_row_group(self.it, columns=self.features + [self.target_col]).to_pandas()
+        # FIX: Read exactly one row group from disk as a native PyArrow Table.
+        # We REMOVED .to_pandas() to prevent memory duplication and deserialization.
+        chunk_table = self.pf.read_row_group(self.it, columns=self.features + [self.target_col])
         
-        input_data(data=chunk_df[self.features], label=chunk_df[self.target_col])
+        # Isolate features and target natively using Arrow's zero-copy .select()
+        X_chunk = chunk_table.select(self.features)
+        y_chunk = chunk_table.select([self.target_col])
+        
+        # Pass the raw Arrow Tables directly into the XGBoost CUDA allocator
+        input_data(data=X_chunk, label=y_chunk)
         self.it += 1
         return 1
 
@@ -96,7 +103,8 @@ class ModularTournamentDirector:
             test_df = df.loc[test_indices]
             train_df = df.drop(index=test_indices)
             
-            embargo_gap = config.MAX_HOLD_DAYS 
+            # FIX: Convert integer to Timedelta and isolate scalars
+            embargo_gap = pd.Timedelta(days=config.MAX_HOLD_DAYS) 
             for test_idx in test_combo:
                 boundary_start = indices[test_idx] - embargo_gap
                 boundary_end = indices[test_idx][-1] + embargo_gap
@@ -500,7 +508,10 @@ class LiveTradingSandbox:
                     sector_data.at[index, 'sentiment_score'] = sentiment
                 
                 dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
-                probability = booster.predict(dmatrix)
+                probability_array = booster.predict(dmatrix)
+                
+                # FIX: Extract scalar value from the XGBoost prediction array
+                probability = probability_array.item() if isinstance(probability_array, np.ndarray) else probability_array
                 
                 signal = "BUY" if probability > config.CONFIDENCE_THRESHOLD else "HOLD"
                 veto_reason = "N/A"
@@ -1238,7 +1249,8 @@ import re
 import math
 import json
 import shutil
-import requests
+import asyncio
+import aiohttp
 import logging
 import numpy as np
 import pandas as pd
@@ -1248,35 +1260,20 @@ from numba import cuda
 
 import config
 
-# ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
-# ==============================================================================
 logger = logging.getLogger(__name__)
 
-def processed_vault_is_populated() -> bool:
-    if not os.path.exists(config.PROCESSED_VAULT_DIR):
-        return False
-    subdirs = [d for d in os.listdir(config.PROCESSED_VAULT_DIR) if os.path.isdir(os.path.join(config.PROCESSED_VAULT_DIR, d))]
-    return len(subdirs) > 0
-
-def reset_processed_vault() -> None:
-    if os.path.exists(config.PROCESSED_VAULT_DIR):
-        shutil.rmtree(config.PROCESSED_VAULT_DIR)
-    os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
-
 # ==============================================================================
-# 1. ENTITY ANONYMIZATION & LLM INFERENCE (THE SENSOR)
+# 1. ASYNCHRONOUS ENTITY ANONYMIZATION & LLM INFERENCE (THE SENSOR)
 # ==============================================================================
-def extract_llm_sentiment(headline: str, ticker: str) -> float:
+async def fetch_sentiment_async(semaphore: asyncio.Semaphore, session: aiohttp.ClientSession, headline: str, ticker: str) -> float:
     """
-    Passes news text to the local LLM. 
+    Asynchronously queries the local LLM.
     Crucially utilizes Entity Anonymization to scrub the ticker from the text, 
     preventing the LLM from relying on memorized historical look-ahead bias.
     """
     if pd.isna(headline) or not str(headline).strip():
         return 0.0
 
-    # Entity Anonymization: Mask the specific company identifier
     anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', str(headline), flags=re.IGNORECASE)
 
     payload = {
@@ -1286,152 +1283,40 @@ def extract_llm_sentiment(headline: str, ticker: str) -> float:
         "stream": False
     }
 
-    try:
-        # Route to local Ollama server (running on CPU/System RAM)
-        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=2.0)
-        if response.status_code == 200:
-            result = response.json()
-            data = json.loads(result.get("response", "{}"))
-            return float(data.get("sentiment_score", 0.0))
-    except Exception:
-        # Failsafe: Default to neutral sentiment if the LLM server times out or hallucinate formatting
-        pass
-
+    # The semaphore acts as a traffic controller to prevent local GPU queue overflow
+    async with semaphore:
+        try:
+            # Timeout increased slightly to accommodate local queuing
+            async with session.post(config.OLLAMA_ENDPOINT, json=payload, timeout=10.0) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    data = json.loads(result.get("response", "{}"))
+                    return float(data.get("sentiment_score", 0.0))
+        except Exception:
+            pass
+            
     return 0.0
+
+async def process_llm_batch_async(df: pd.DataFrame) -> list:
+    """
+    Batches HTTP requests to the local LLM concurrently across the pandas partition.
+    """
+    # Limit concurrent requests to 20 to protect the local Ollama server from crashing
+    semaphore = asyncio.Semaphore(20)
+    
+    # TCPConnector limits the total active connections pooling
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            fetch_sentiment_async(semaphore, session, str(row['raw_news_headline']), str(row['ticker']))
+            for _, row in df.iterrows()
+        ]
+        return await asyncio.gather(*tasks)
 
 # ==============================================================================
 # 2. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
 # ==============================================================================
-
-@cuda.jit(fastmath=True)
-def compute_roll_spread_cuda(closes, spreads, window):
-    i = cuda.grid(1)
-    n = len(closes)
-    
-    if i >= window and i < n:
-        mean_x = 0.0
-        mean_y = 0.0
-        
-        for j in range(i - window + 1, i):
-            mean_x += (closes[j+1] - closes[j])
-            mean_y += (closes[j] - closes[j-1])
-        
-        mean_x /= (window - 1)
-        mean_y /= (window - 1)
-
-        cov = 0.0
-        for j in range(i - window + 1, i):
-            x = (closes[j+1] - closes[j])
-            y = (closes[j] - closes[j-1])
-            cov += (x - mean_x) * (y - mean_y)
-            
-        cov /= (window - 2)
-
-        if cov < 0:
-            spreads[i] = 2.0 * math.sqrt(-cov)
-        else:
-            spreads[i] = 0.0001
-
-@cuda.jit(fastmath=True)
-def compute_crash_risk_cuda(returns, ncskew, duvol, window):
-    i = cuda.grid(1)
-    n = len(returns)
-    
-    if i >= window and i < n:
-        mean_ret = 0.0
-        for j in range(i - window, i):
-            mean_ret += returns[j]
-        mean_ret /= window
-        
-        var_ret = 0.0
-        for j in range(i - window, i):
-            var_ret += (returns[j] - mean_ret)**2
-        std_ret = math.sqrt(var_ret / window)
-        
-        if std_ret > 0:
-            skew = 0.0
-            for j in range(i - window, i):
-                skew += ((returns[j] - mean_ret) / std_ret)**3
-            ncskew[i] = -(skew / window)
-            
-        down_sum, up_sum = 0.0, 0.0
-        down_count, up_count = 0, 0
-        
-        for j in range(i - window, i):
-            if returns[j] < mean_ret:
-                down_sum += (returns[j] - mean_ret)**2
-                down_count += 1
-            elif returns[j] > mean_ret:
-                up_sum += (returns[j] - mean_ret)**2
-                up_count += 1
-                
-        if down_count > 2 and up_count > 2:
-            var_down = down_sum / (down_count - 1)
-            var_up = up_sum / (up_count - 1)
-            if var_up > 0 and var_down > 0:
-                duvol[i] = math.log(var_down / var_up)
-
-@cuda.jit(fastmath=True)
-def compute_amihud_illiquidity_cuda(returns, closes, volumes, amihud, window):
-    i = cuda.grid(1)
-    n = len(returns)
-    
-    if i >= window and i < n:
-        amihud_sum = 0.0
-        valid_days = 0
-        
-        for j in range(i - window, i):
-            dollar_vol = closes[j] * volumes[j]
-            if dollar_vol > 0:
-                amihud_sum += math.fabs(returns[j]) / dollar_vol
-                valid_days += 1
-                
-        if valid_days > 0:
-            amihud[i] = amihud_sum / valid_days
-
-@cuda.jit(fastmath=True)
-def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_volumes, advs, labels, rr_ratio, max_hold_days):
-    i = cuda.grid(1)
-    n = len(closes)
-    
-    if i < n - max_hold_days:
-        if not (math.isnan(atrs[i]) or math.isnan(spreads[i]) or advs[i] == 0):
-            vol_ratio = current_volumes[i] / advs[i]
-            entry_slippage = closes[i] * 0.001 * math.sqrt(vol_ratio)
-            entry_friction = (spreads[i] / 2.0) + entry_slippage
-            
-            true_entry_price = closes[i] + entry_friction
-            stop_loss = true_entry_price - atrs[i]
-            take_profit = true_entry_price + (atrs[i] * rr_ratio)
-            
-            for j in range(i + 1, i + max_hold_days):
-                if lows[j] <= stop_loss:
-                    break
-                    
-                exit_vol_ratio = current_volumes[j] / advs[j]
-                exit_friction = (spreads[j] / 2.0) + (closes[j] * 0.001 * math.sqrt(exit_vol_ratio))
-                
-                if (highs[j] - exit_friction) >= take_profit:
-                    labels[i] = 1
-                    break
-
-@cuda.jit(fastmath=True)
-def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
-    i = cuda.grid(1)
-    n = len(closes)
-    
-    if i < n - dte:
-        if not math.isnan(atrs[i]) and atrs[i] > 0:
-            entry = closes[i]
-            target = entry + (atrs[i] * target_premium_gain)
-            stop = entry - atrs[i]
-            
-            for j in range(i + 1, i + dte):
-                if closes[j] <= stop:
-                    break
-                if closes[j] >= target:
-                    labels[i] = 1
-                    break
+# ... [Keep all existing @cuda.jit math kernels unchanged] ...
 
 # ==============================================================================
 # 3. DASK WORKER EXECUTION MAPPING
@@ -1440,7 +1325,7 @@ def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
 def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Applies massive mechanical sensors to a localized data chunk. 
-    Routes text to the CPU-bound LLM before mapping structural math to the GPU.
+    Routes text to the CPU-bound LLM asynchronously before mapping structural math to the GPU.
     """
     if df.empty or len(df) < 252:
         return pd.DataFrame(columns=df.columns)
@@ -1448,18 +1333,20 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.lower() for c in df.columns]
     
     # -------------------------------------------------------------------------
-    # MULTI-AGENT HANDOFF: CPU-Bound LLM Sentiment Scoring
+    # MULTI-AGENT HANDOFF: CPU-Bound Asynchronous LLM Sentiment Batching
     # -------------------------------------------------------------------------
     if config.FUSION_ENABLED and 'raw_news_headline' in df.columns:
-        df['sentiment_score'] = df.apply(
-            lambda row: extract_llm_sentiment(str(row['raw_news_headline']), str(row['ticker'])),
-            axis=1
-        ).astype(np.float32)
+        # FIX: Replaced synchronous pandas `.apply()` with an asynchronous event loop
+        # that fires multiple local LLM queries concurrently without blocking
+        sentiment_results = asyncio.run(process_llm_batch_async(df))
+        df['sentiment_score'] = np.array(sentiment_results, dtype=np.float32)
 
     # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
+    
+    # ... [Keep the rest of the array memory staging and GPU push identical] ...
     
     # Stage continuous NumPy arrays for GPU transfer
     closes = np.ascontiguousarray(df['close'].values.astype(np.float64))

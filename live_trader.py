@@ -1,5 +1,7 @@
 import os
 import re
+import gc
+import math
 import json
 import time
 import requests
@@ -10,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import xgboost as xgb
 
-from numba import config as numba_config, njit, prange
+from numba import config as numba_config, njit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -36,10 +38,7 @@ def fetch_live_sentiment(ticker: str) -> float:
     if not config.FUSION_ENABLED:
         return 0.0
 
-    # In a live deployment, replace this mock with a real-time news API (e.g., NewsAPI or Alpaca News)
     live_headline = f"Breaking pre-market developments expected to impact {ticker} today."
-    
-    # Entity Anonymization Engine
     anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', live_headline, flags=re.IGNORECASE)
 
     payload = {
@@ -62,12 +61,12 @@ def fetch_live_sentiment(ticker: str) -> float:
 # ==============================================================================
 # 2. THE SHIELD AGENT: CPU-PARALLELIZED RISK MANAGER
 # ==============================================================================
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True)
 def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: float, 
                              account_capital: float, max_risk_pct: float) -> tuple:
     """
     Intel TBB Parallelized Risk Manager.
-    Evaluates fractional sizing and volatility stops. Returns (Is_Approved, Position_Size).
+    Evaluates sizing and volatility stops. Returns (Is_Approved, Position_Size).
     """
     stop_loss = entry_price - (atr_multiplier * atr)
     risk_per_share = entry_price - stop_loss
@@ -78,12 +77,14 @@ def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: flo
     capital_at_risk = account_capital * max_risk_pct
     position_size = capital_at_risk / risk_per_share
     
-    # Fractional position sizing constraint
     max_allowable_shares = account_capital / entry_price
     position_size = min(position_size, max_allowable_shares)
     
-    if position_size < 1.0: # Alpaca requires at least 1 fractional/whole share minimum depending on asset
-        return False, 0.0 # Veto: Account too small for safe risk profile
+    # FIX: Hard force floor rounding to avoid Alpaca fractional share rejections entirely
+    position_size = math.floor(position_size)
+    
+    if position_size < 1.0: 
+        return False, 0.0 # Veto: Account too small for safe risk profile on this asset
         
     return True, position_size
 
@@ -94,7 +95,6 @@ class LiveTradingSandbox:
     def __init__(self, is_paper: bool = True):
         self.is_paper = is_paper
         
-        # 1. Credential Routing
         self.api_key = os.environ.get('ALPACA_PAPER_API_KEY') if is_paper else os.environ.get('ALPACA_LIVE_API_KEY')
         self.secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
         
@@ -103,13 +103,11 @@ class LiveTradingSandbox:
             
         self.client = TradingClient(self.api_key, self.secret_key, paper=self.is_paper)
         
-        # Verify Alpaca Connection
         account = self.client.get_account()
         self.buying_power = float(account.buying_power)
         logger.info(f"Connected to Alpaca. Mode: {'PAPER' if is_paper else 'LIVE'}. Buying Power: ${self.buying_power:,.2f}")
 
     def load_champion_model(self, sector_name: str) -> tuple:
-        """Loads the XGBoost model and its precise feature manifest from production."""
         model_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
         features_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion_features.json")
         
@@ -125,10 +123,6 @@ class LiveTradingSandbox:
         return booster, features
 
     def execute_live_cycle(self, live_market_df: pd.DataFrame) -> None:
-        """
-        Orchestrates the live stream across all commissioned models.
-        Logs independent decisions to a PyArrow ledger for the Streamlit dashboard.
-        """
         logger.info(f"Initiating Live Market Cycle (Fusion: {config.FUSION_ENABLED}, Risk Manager: {config.RISK_MANAGER_ENABLED})")
         
         unique_sectors = live_market_df['sector'].unique()
@@ -146,13 +140,10 @@ class LiveTradingSandbox:
                 current_price = row['close']
                 current_atr = row['atr']
                 
-                # PHASE 1: THE SENSOR AGENT (LLM)
                 if config.FUSION_ENABLED:
                     sentiment = fetch_live_sentiment(ticker)
                     sector_data.at[index, 'sentiment_score'] = sentiment
                 
-                # PHASE 2: THE QUANTITATIVE AGENT (XGBoost)
-                # Note: GPU prediction handles missing parameters intelligently
                 dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
                 probability = booster.predict(dmatrix)
                 
@@ -161,7 +152,6 @@ class LiveTradingSandbox:
                 position_size = 0.0
                 executed = False
                 
-                # PHASE 3: THE SHIELD AGENT (Risk Manager)
                 if signal == "BUY" and config.RISK_MANAGER_ENABLED:
                     is_approved, position_size = evaluate_risk_veto_gates(
                         current_price, current_atr, config.ATR_STOP_MULTIPLIER, 
@@ -175,16 +165,15 @@ class LiveTradingSandbox:
                         executed = self.route_alpaca_order(ticker, position_size)
                         
                 elif signal == "BUY" and not config.RISK_MANAGER_ENABLED:
-                    # Naked execution (Warning: Dangerous in live markets)
+                    # Naked execution defaults to 1 whole share
                     position_size = 1.0 
                     executed = self.route_alpaca_order(ticker, position_size)
 
-                # Append Telemetry
                 ledger_entries.append({
                     "timestamp": pd.Timestamp.now(),
                     "ticker": ticker,
                     "sector": sector,
-                    "probability": probability,
+                    "probability": float(probability) if isinstance(probability, np.ndarray) else float(probability),
                     "sentiment": sector_data.at[index, 'sentiment_score'] if config.FUSION_ENABLED else 0.0,
                     "signal": signal,
                     "veto_reason": veto_reason,
@@ -192,7 +181,13 @@ class LiveTradingSandbox:
                     "executed": executed
                 })
                 
-        # Flush Telemetry to PyArrow Ledger
+                # FIX 1: Flush DMatrix from GPU VRAM after every inference
+                del dmatrix
+
+            # FIX 2: Flush XGBoost Booster graph from GPU VRAM after sector completes
+            del booster, features
+            gc.collect()
+                
         if ledger_entries:
             os.makedirs(config.LIVE_LOG_DIR, exist_ok=True)
             df_ledger = pd.DataFrame(ledger_entries)
@@ -200,16 +195,16 @@ class LiveTradingSandbox:
             pq.write_to_dataset(table, root_path=config.LIVE_LOG_DIR, partition_cols=['sector'])
 
     def route_alpaca_order(self, ticker: str, quantity: float) -> bool:
-        """Executes the authentic Alpaca Market Order."""
         try:
             order_request = MarketOrderRequest(
                 symbol=ticker,
-                qty=round(quantity, 2), # Alpaca supports fractional shares
+                # Enforce integer typing for Alpaca API strictly to match the floor logic
+                qty=int(quantity), 
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY
             )
             self.client.submit_order(order_data=order_request)
-            logger.info(f"EXECUTED: {ticker} | Qty: {quantity}")
+            logger.info(f"EXECUTED: {ticker} | Qty: {int(quantity)}")
             return True
         except Exception as e:
             logger.error(f"Alpaca Routing Failed for {ticker}: {e}")

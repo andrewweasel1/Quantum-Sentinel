@@ -2,7 +2,7 @@ import os
 import glob
 import itertools
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -81,6 +81,29 @@ class QuantitativeEvaluator:
         pbo_value = np.sum(np.array(logits) < 0) / len(logits)
         return float(pbo_value)
 
+    def calculate_alpha_decay(self, champion_returns: pd.Series, benchmark_returns: pd.Series) -> Tuple[float, float, float]:
+        """
+        Calculates Alpha Decay by splitting the performance into two periods (P1 and P2).
+        Mimics the Look-Ahead-Bench dual-period evaluation to detect LLM memorization and 
+        the 'Scaling Paradox'.
+        """
+        split_idx = len(champion_returns) // 2
+        
+        # P1: Early Period
+        champ_p1_ret = champion_returns.iloc[:split_idx].mean() * 252
+        bench_p1_ret = benchmark_returns.iloc[:split_idx].mean() * 252
+        alpha_p1 = champ_p1_ret - bench_p1_ret
+        
+        # P2: Late Period (Generalization Test)
+        champ_p2_ret = champion_returns.iloc[split_idx:].mean() * 252
+        bench_p2_ret = benchmark_returns.iloc[split_idx:].mean() * 252
+        alpha_p2 = champ_p2_ret - bench_p2_ret
+        
+        # Decay is the percentage point (pp) drop in Alpha from P1 to P2
+        alpha_decay = alpha_p2 - alpha_p1
+        
+        return alpha_decay, alpha_p1, alpha_p2
+
     def assess_sector(self, sector_name: str) -> bool:
         logger.info(f"\n{'='*60}\nEvaluating Candidate for Sector: {sector_name}\n{'='*60}")
 
@@ -130,10 +153,20 @@ class QuantitativeEvaluator:
         except Exception:
             return False
 
-        # 4. Generate Institutional Tearsheet
+        # 4. Look-Ahead Bias & Alpha Decay Detection
+        logger.info("4. Evaluating Alpha Decay (Look-Ahead Bias)...")
+        alpha_decay, alpha_p1, alpha_p2 = self.calculate_alpha_decay(champion_returns, benchmark_returns)
+        logger.info(f"[{sector_name}] Alpha P1: {alpha_p1*100:.2f}% | Alpha P2: {alpha_p2*100:.2f}% | Alpha Decay: {alpha_decay*100:.2f} pp")
+        
+        # Standard foundation models have been shown to decay more than -15pp when tested strictly out-of-sample
+        if config.FUSION_ENABLED and alpha_decay < -0.15:
+            logger.warning(f"[{sector_name}] SEVERE ALPHA DECAY DETECTED: The LLM is exhibiting the 'Scaling Paradox'.")
+            logger.warning("The foundation model is relying on memorized pre-training data (Memory Trap) rather than genuine reasoning.")
+            logger.warning("RECOMMENDATION: Swap your standard model for a Point-in-Time (PiT) model like Pitinf-Small or Pitinf-Medium.")
+
+        # 5. Generate Institutional Tearsheet
         logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
         try:
-            # FUSION EVALUATION: Append LLM sentiment to tearsheet correlation reporting if active
             if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
                 bench_df.index = pd.date_range(start='2020-01-01', periods=len(bench_df), freq='D')
                 qs.reports.html(

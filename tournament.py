@@ -8,6 +8,7 @@ from typing import Tuple, List, Optional, Any, Dict, Generator
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
+import pyarrow.parquet as pq
 import xgboost as xgb
 from itertools import combinations
 from numba import njit
@@ -17,35 +18,41 @@ import config
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. OUT-OF-CORE BATCH ITERATOR & RISK SIMULATOR
+# 1. OUT-OF-CORE PYARROW ITERATOR (TRUE ZERO-COPY) & RISK SIMULATOR
 # ==============================================================================
-class DataFrameIter(xgb.DataIter):
-    def __init__(self, X: pd.DataFrame, y: pd.Series, batch_size: int = 100000):
+class ParquetDataIter(xgb.DataIter):
+    """
+    A true out-of-core XGBoost Data Iterator.
+    Reads chunked row groups directly from disk via PyArrow, ensuring neither 
+    Host RAM nor GPU VRAM is ever exhausted during massive CPCV evaluations.
+    """
+    def __init__(self, file_path: str, features: List[str], target_col: str):
         super().__init__(on_host=True)
-        self.X = X
-        self.y = y
-        self.batch_size = batch_size
-        self.n_batches = int(np.ceil(len(X) / batch_size))
+        self.file_path = file_path
+        self.features = features
+        self.target_col = target_col
+        
+        # Initialize PyArrow Parquet reader
+        self.pf = pq.ParquetFile(file_path)
+        self.num_row_groups = self.pf.num_row_groups
         self.it = 0
 
     def reset(self) -> None:
         self.it = 0
 
     def next(self, input_data: Any) -> int:
-        if self.it == self.n_batches:
+        if self.it == self.num_row_groups:
             return 0
-        start = self.it * self.batch_size
-        end = min((self.it + 1) * self.batch_size, len(self.X))
-        input_data(data=self.X.iloc[start:end], label=self.y.iloc[start:end])
+            
+        # Read exactly one row group (chunk) from disk
+        chunk_df = self.pf.read_row_group(self.it, columns=self.features + [self.target_col]).to_pandas()
+        
+        input_data(data=chunk_df[self.features], label=chunk_df[self.target_col])
         self.it += 1
         return 1
 
 @njit(fastmath=True)
 def simulate_risk_manager_njit(signals, closes, lows, atrs, atr_multiplier, max_risk_pct):
-    """
-    Simulates the Risk Manager's fractional sizing and dynamic ATR stops during CPCV.
-    Executes in microseconds via LLVM compiler to prevent CPU bottlenecking.
-    """
     n = len(signals)
     returns = np.zeros(n)
     
@@ -54,10 +61,9 @@ def simulate_risk_manager_njit(signals, closes, lows, atrs, atr_multiplier, max_
             entry = closes[i]
             stop = entry - (atr_multiplier * atrs[i])
             
-            # Fractional Position Sizing
             risk_distance = (entry - stop) / entry
             size = max_risk_pct / risk_distance if risk_distance > 0 else 0.0
-            size = min(size, 1.0) # Hard cap to prevent leverage blowouts
+            size = min(size, 1.0) 
             
             if lows[i+1] <= stop:
                 returns[i] = -risk_distance * size
@@ -107,7 +113,7 @@ class ModularTournamentDirector:
         features = [c for c in sector_df.columns if c not in config.METADATA_COLS]
 
         param_grid = {
-            'max_depth': [4, 5],               
+            'max_depth': [3-5],             
             'min_child_weight': [1.0, 3.0],  
             'gamma': [0.1],
             'learning_rate': [0.01, 0.05],
@@ -126,6 +132,10 @@ class ModularTournamentDirector:
         best_returns: np.ndarray = np.array([])
         benchmark_calculated = False
         
+        temp_train_path = f"temp_train_{sector_name}.parquet"
+        temp_test_path = f"temp_test_{sector_name}.parquet"
+        temp_full_path = f"temp_full_{sector_name}.parquet"
+        
         for trial_idx, params in enumerate(grid_combinations):
             params['tree_method'] = 'hist'
             params['device'] = 'cuda'
@@ -137,11 +147,14 @@ class ModularTournamentDirector:
             trial_sentiment = []
             
             for train_df, test_df in self.generate_cpcv_splits(sector_df):
-                X_train, y_train = train_df[features], train_df[target_col]
-                X_test, y_test = test_df[features], test_df[target_col]
+                
+                # Write CPCV splits dynamically to disk with a rigid row_group_size constraint 
+                # This explicitly forces PyArrow to build the chunks the iterator will read
+                train_df.to_parquet(temp_train_path, engine='pyarrow', row_group_size=100000)
+                test_df.to_parquet(temp_test_path, engine='pyarrow', row_group_size=100000)
 
-                train_iter = DataFrameIter(X_train, y_train, batch_size=100000)
-                test_iter = DataFrameIter(X_test, y_test, batch_size=100000)
+                train_iter = ParquetDataIter(temp_train_path, features, target_col)
+                test_iter = ParquetDataIter(temp_test_path, features, target_col)
                 
                 dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
                 dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
@@ -158,7 +171,6 @@ class ModularTournamentDirector:
                 preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
                 signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
                 
-                # SHIELD AGENT: Apply Risk Manager Simulation
                 if config.RISK_MANAGER_ENABLED:
                     closes = test_df['close'].values
                     lows = test_df['low'].values
@@ -195,11 +207,14 @@ class ModularTournamentDirector:
                     fusion_signals = trial_sentiment
 
         if best_params is not None and len(best_returns) > 0:
-            full_iter = DataFrameIter(sector_df[features], sector_df[target_col], batch_size=100000)
+            
+            # Final Candidate Training mapped directly through PyArrow out-of-core
+            sector_df.to_parquet(temp_full_path, engine='pyarrow', row_group_size=100000)
+            full_iter = ParquetDataIter(temp_full_path, features, target_col)
             d_full = xgb.ExtMemQuantileDMatrix(full_iter)
+            
             candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
             
-            # FUSION EVALUATION: Feature Displacement Logging
             if config.FUSION_ENABLED:
                 importances = candidate_booster.get_score(importance_type='gain')
                 sorted_imp = sorted(importances.items(), key=lambda x: x[6], reverse=True)
@@ -227,6 +242,11 @@ class ModularTournamentDirector:
 
             logger.info(f"[{sector_name}] Matrix & Benchmark exported. Awaiting Evaluator verification.")
         
+        # Safely sweep temporary out-of-core PyArrow files from disk
+        for file in [temp_train_path, temp_test_path, temp_full_path]:
+            if os.path.exists(file):
+                os.remove(file)
+                
         gc.collect()
 
     def execute_gauntlet(self) -> None:

@@ -375,12 +375,32 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import xgboost as xgb
 
-from numba import config as numba_config, njit
+from numba import njit # FIX: Removed unused numba_config to prevent TBB dependency crash
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 import config
+
+def fetch_live_sentiment(ticker: str) -> float:
+    if not config.FUSION_ENABLED:
+        return 0.0
+
+    live_headline = f"Breaking pre-market developments expected to impact {ticker} today."
+    anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', live_headline, flags=re.IGNORECASE)
+
+    payload = {
+        "model": config.LLM_MODEL_NAME,
+        "prompt": f"{config.LLM_SYSTEM_PROMPT}\n\nHeadline: {anonymized_headline}",
+        "format": "json",
+        "stream": False
+    }
+
+    try:
+        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=3.0)
+        if response.status_code == 200:
+            data = json.loads(response.json().get("response", "{}"))
+            return float(data.get("sentiment_score", 0.0))
 
 # ==============================================================================
 # 0. CENTRALIZED LOGGING & INTEL TBB CONFIGURATION
@@ -588,39 +608,30 @@ import logging
 from typing import Dict
 import config
 
-# ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
-# ==============================================================================
 logger = logging.getLogger(__name__)
 
 def raw_vault_is_populated() -> bool:
-    """Checks if the raw vault directory exists and contains partitioned data."""
     if not os.path.exists(config.RAW_VAULT_DIR):
         return False
     subdirs = [d for d in os.listdir(config.RAW_VAULT_DIR) if os.path.isdir(os.path.join(config.RAW_VAULT_DIR, d))]
     return len(subdirs) > 0
 
 def reset_raw_vault() -> None:
-    """Clears existing data to prevent duplicate or corrupted legacy files."""
     if os.path.exists(config.RAW_VAULT_DIR):
         shutil.rmtree(config.RAW_VAULT_DIR)
     os.makedirs(config.RAW_VAULT_DIR, exist_ok=True)
 
-# ==============================================================================
-# 1. TEMPORARY BYPASS: STATIC UNIVERSE MAPPING
-# ==============================================================================
 def get_survivorship_adjusted_universe() -> Dict[str, str]:
     """
     TEMPORARY BYPASS: Fetches current S&P 500 constituents from Wikipedia.
-    WARNING: This strictly introduces SURVIVORSHIP BIAS. 
-    It is intended only for pipeline and architecture testing (Cold Run validation).
     """
     logger.warning("EODHD API bypassed. Fetching static S&P 500 list from Wikipedia.")
     
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url)
-        df = tables
+        # FIX: pd.read_html returns a list of DataFrames. Index the first table.
+        df = tables 
         
         universe = {}
         for _, row in df.iterrows():
@@ -634,19 +645,7 @@ def get_survivorship_adjusted_universe() -> Dict[str, str]:
         logger.error("Failed to map sector universe from Wikipedia.", exc_info=True)
         return {}
 
-# ==============================================================================
-# 2. POINT-IN-TIME NEWS ACQUISITION (THE SENSOR)
-# ==============================================================================
 def fetch_point_in_time_news(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
-    """
-    Fetches historical financial news conditionally. 
-    CRITICAL: To prevent the 'Scaling Paradox' and look-ahead bias identified in 
-    financial LLM literature, this data must be strictly Point-in-Time (PiT), 
-    meaning headlines are restricted to those published BEFORE market open of the given date.
-    """
-    # For the local Cold Run, we generate a mock historical headline placeholder. 
-    # For a live capital deployment, this must be swapped for a query to the 
-    # Kaggle Financial News Archive or a premium EODHD news endpoint.
     news_data = {
         "date": dates,
         "raw_news_headline": [f"Standard pre-market conditions persist for {ticker}."] * len(dates)
@@ -655,11 +654,7 @@ def fetch_point_in_time_news(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFra
     news_df.set_index("date", inplace=True)
     return news_df
 
-# ==============================================================================
-# 3. ISOLATED THREAD INGESTION (ZERO-COPY PYARROW)
-# ==============================================================================
 def ingest_raw_ticker(ticker: str, sector: str) -> bool:
-    """Thread-safe isolated extraction processing loop for a single ticker."""
     try:
         df = yf.download(
             ticker, 
@@ -677,13 +672,10 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
         df['ticker'] = ticker
         df['sector'] = sector
         
-        # LLM FUSION: Conditionally merge Point-in-Time News
         if config.FUSION_ENABLED:
             news_df = fetch_point_in_time_news(ticker, df.index)
             df = df.join(news_df, how='left')
         
-        # MEMORY OPTIMIZATION: Convert Pandas types to strict PyArrow memory backends.
-        # This prevents Pandas from duplicating data in RAM during the Dask hand-off.
         df = df.convert_dtypes(dtype_backend="pyarrow")
         
         out_dir = os.path.join(config.RAW_VAULT_DIR, f"sector={sector}")
@@ -696,19 +688,13 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
         logger.error(f"Ingestion failed for {ticker} in sector {sector}.", exc_info=True)
         return False
 
-# ==============================================================================
-# 4. ASYNCHRONOUS ORCHESTRATION
-# ==============================================================================
 def build_raw_vault(universe_map: Dict[str, str]) -> None:
-    """Asynchronous pipeline leveraging host thread scaling to populate the local vault."""
     logger.info(f"Executing raw data acquisition layer (Fusion Mode: {'ON' if config.FUSION_ENABLED else 'OFF'})...")
     reset_raw_vault()
     
     success_count = 0
-    
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = {executor.submit(ingest_raw_ticker, ticker, sector): ticker for ticker, sector in universe_map.items()}
-        
         for future in as_completed(futures):
             if future.result():
                 success_count += 1
@@ -718,126 +704,21 @@ def build_raw_vault(universe_map: Dict[str, str]) -> None:
 --- FILE: ./config.py ---
 
 import os
-import pyarrow as pa
-from datetime import datetime, timedelta
-
-# ==============================================================================
-# 1. GLOBAL SYSTEM RUN MODE & FEATURE TOGGLES
-# ==============================================================================
-# Toggles operational mode: Use "STANDARD" (Equity) or "OPTIONS" (Delta Simulation)
-RUN_MODE = "STANDARD"
-
-# These will be dynamically overridden by main.py argparse at runtime
-FUSION_ENABLED = False
-RISK_MANAGER_ENABLED = True
-
-# 3-Year Historical Lookback Window
-START_DATE = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
-END_DATE = datetime.now().strftime('%Y-%m-%d')
-
-# ==============================================================================
-# 2. LLM & SENTIMENT FUSION PARAMETERS (The Sensor)
-# ==============================================================================
-# Defaults designed for a local quantized model via Ollama to protect privacy
-OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
-LLM_MODEL_NAME = "llama3:8b"
-LLM_TOKEN_LIMIT = 512
-LLM_SYSTEM_PROMPT = """You are an objective Quantitative Risk Analyst. 
-Read the following anonymized financial news headline. 
-Output ONLY a valid JSON dictionary with a single key "sentiment_score" 
-and a float value between -1.0 (extreme bearish) and 1.0 (extreme bullish). 
-Do not provide any other text or reasoning."""
-
-# ==============================================================================
-# 3. RISK MANAGER PARAMETERS (The Shield)
-# ==============================================================================
-MAX_DAILY_DRAWDOWN = -0.03   # 3% daily account drawdown limit (Veto parameter)
-ATR_STOP_MULTIPLIER = 1.5    # Trailing stop distance multiplier
-MAX_RISK_PER_TRADE = 0.02    # Risk exactly 2% of account capital per position
-MAX_CORRELATION_LIMIT = 0.7  # Veto trades if highly correlated assets exceed this
-
-# ==============================================================================
-# 4. DATA VAULT & LOGGING DIRECTORY PATHS
-# ==============================================================================
-RAW_VAULT_DIR = "./market_vault_raw"
-PROCESSED_VAULT_DIR = f"./market_vault_processed_{RUN_MODE.lower()}"
-RESULTS_FILE = "tournament_final_results.parquet"
-LIVE_LOG_DIR = "./live_execution_ledger"
-PROD_MODELS_DIR = "./production_models"
-
-# System Logging
-LOG_DIR = "./system_logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-SYSTEM_LOG_FILE = os.path.join(LOG_DIR, "quantum_sentinel.log")
-
-# ==============================================================================
-# 5. HYPERPARAMETERS & MAGIC NUMBERS
-# ==============================================================================
-CONFIDENCE_THRESHOLD = 0.65
-MAX_HOLD_DAYS = 20
-RR_RATIO = 2.0
-OPTIONS_DTE = 21
-TARGET_PREMIUM_GAIN = 0.50
-
-# Excluded from the XGBoost feature matrix
-METADATA_COLS = [
-    'open', 'high', 'low', 'close', 'adj close', 'volume', 
-    'target_label', 'option_target_label', 'ticker', 'sector', 'date'
-]
-
-# ==============================================================================
-# 6. OUT-OF-CORE DASK & PARQUET CONFIGURATION
-# ==============================================================================
-PARQUET_BLOCKSIZE = "256MiB"
-
-# Upgraded dtype_backend to 'pyarrow' to prevent Pandas memory duplication
-DASK_READ_KWARGS = {
-    "engine": "pyarrow",
-    "blocksize": PARQUET_BLOCKSIZE,
-    "split_row_groups": "infer",
-    "dtype_backend": "pyarrow"  
-}
-
-# ==============================================================================
-# 7. DYNAMIC PYARROW SCHEMA MAPPING
-# ==============================================================================
-def get_market_schema() -> pa.Schema:
-    """
-    Dynamically generates the memory-mapped PyArrow schema.
-    If FUSION_ENABLED is True, it appends the 'sentiment_score' feature so Dask expects it.
-    """
-    fields = [
-        ("date", pa.timestamp('ns')),
-        ("ticker", pa.dictionary(pa.int32(), pa.string())),
-        ("sector", pa.dictionary(pa.int32(), pa.string())),
-        ("open", pa.float64()),
-        ("high", pa.float64()),
-        ("low", pa.float64()),
-        ("close", pa.float64()),
-        ("volume", pa.float64()),
-    ]
-    
-    if FUSION_ENABLED:
-        fields.append(("sentiment_score", pa.float32()))
-        
-    return pa.schema(fields)
-2. main.py (The Orchestrator)
-Now we must ensure the argparse toggles execute before any of the other machine learning modules are imported into memory. If we import tournament or feature_compiler before injecting the boolean toggles into config, Python will cache the old states, breaking the fusion execution.
-import os
 import argparse
 import logging
+import pandas as pd
 
 # ==============================================================================
 # 1. ARGPARSE & GLOBAL STATE INJECTION
 # ==============================================================================
-# Parse arguments FIRST before touching downstream quantitative modules
 parser = argparse.ArgumentParser(description="Quantum Sentinel V6 - Multi-Agent Engine")
 parser.add_argument("--refresh-raw", action="store_true", help="Refresh raw market data")
 parser.add_argument("--fusion", action="store_true", help="Enable LLM Sentiment Fusion Agent")
 parser.add_argument("--disable-risk-manager", action="store_true", help="Disable the Risk Manager Agent")
+parser.add_argument("--evaluate", action="store_true", help="Run the statistical Evaluator to promote models")
+parser.add_argument("--live", action="store_true", help="Launch the Live Trading Sandbox")
 args = parser.parse_args()
 
-# Inject the toggled states into config BEFORE other modules load
 import config
 config.FUSION_ENABLED = args.fusion
 config.RISK_MANAGER_ENABLED = not args.disable_risk_manager
@@ -845,12 +726,13 @@ config.RISK_MANAGER_ENABLED = not args.disable_risk_manager
 # ==============================================================================
 # 2. CENTRALIZED LOGGING CONFIGURATION
 # ==============================================================================
+# FIX: Logging MUST be configured before importing dependent modules
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
-        logging.StreamHandler()                       # Prints to console
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  
+        logging.StreamHandler()                       
     ]
 )
 logger = logging.getLogger(__name__)
@@ -858,24 +740,43 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # 3. DOWNSTREAM MODULE IMPORTS
 # ==============================================================================
-# Import custom modules AFTER config state is locked and logging is configured
 import data_ingestion
 import feature_compiler
 import tournament
+import evaluator
+import live_trader
 
 def main():
     logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
     logger.info(f"LLM Fusion Agent: {'ONLINE' if config.FUSION_ENABLED else 'OFFLINE'}")
     logger.info(f"Risk Manager Agent: {'ONLINE' if config.RISK_MANAGER_ENABLED else 'OFFLINE'}")
     
+    # PHASE 1: DATA PIPELINE & TRAINING
     if args.refresh_raw:
         universe = data_ingestion.get_survivorship_adjusted_universe()
         data_ingestion.build_raw_vault(universe)
+        feature_compiler.compile_features_from_raw()
+        
+        director = tournament.ModularTournamentDirector()
+        director.execute_gauntlet()
 
-    feature_compiler.compile_features_from_raw()
-    
-    director = tournament.ModularTournamentDirector()
-    director.execute_gauntlet()
+    # PHASE 2: STATISTICAL EVALUATION
+    if args.evaluate:
+        stat_evaluator = evaluator.QuantitativeEvaluator()
+        stat_evaluator.run_evaluation_gauntlet()
+
+    # PHASE 3: LIVE MARKET EXECUTION
+    if args.live:
+        logger.info("Initializing Live Trading Sandbox via Alpaca...")
+        sandbox = live_trader.LiveTradingSandbox(is_paper=True)
+        
+        logger.info("Sourcing live market data for active champions...")
+        live_market_df = pd.read_parquet(config.PROCESSED_VAULT_DIR, engine="pyarrow")
+        
+        latest_date = live_market_df['date'].max()
+        current_data = live_market_df[live_market_df['date'] == latest_date].copy()
+        
+        sandbox.execute_live_cycle(current_data)
 
 if __name__ == "__main__":
     main()
@@ -1256,6 +1157,7 @@ import json
 import shutil
 import asyncio
 import aiohttp
+import nest_asyncio
 import logging
 import numpy as np
 import pandas as pd
@@ -1264,6 +1166,9 @@ import pandas_ta as ta
 from numba import cuda
 
 import config
+
+# FIX: Allow asyncio.run() to operate securely inside Dask's existing worker event loops
+nest_asyncio.apply()
 
 logger = logging.getLogger(__name__)
 

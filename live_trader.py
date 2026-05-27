@@ -106,7 +106,7 @@ def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: flo
     if position_size < 1.0: 
         return False, 0.0 # Veto: Account too small for safe risk profile on this asset
         
-    return True, position_size
+    return True, float(position_size)
 
 # ==============================================================================
 # 3. LIVE SANDBOX EXECUTION CYCLE

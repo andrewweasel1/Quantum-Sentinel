@@ -63,7 +63,7 @@ async def process_llm_batch_async(df: pd.DataFrame) -> list:
     semaphore = asyncio.Semaphore(20)
     
     # TCPConnector limits the total active connections pooling
-    connector = aiohttp.TCPConnector(limit=20)
+    connector = aiohttp.TCPConnector(limit=20, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
             fetch_sentiment_async(semaphore, session, str(row['raw_news_headline']), str(row['ticker']))
@@ -104,7 +104,8 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
     
-    # ... [Keep the rest of the array memory staging and GPU push identical] ...
+   # FIX: Purge NaNs prior to VRAM transfer to prevent IEEE-754 CUDA array poisoning
+    df = df.dropna()
     
     # Stage continuous NumPy arrays for GPU transfer
     # FIX: Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
@@ -171,7 +172,6 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'raw_news_headline' in df.columns:
         df = df.drop(columns=['raw_news_headline'])
 
-    df = df.dropna()
     return df
 
 def compile_features_from_raw() -> None:

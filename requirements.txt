@@ -26,6 +26,8 @@ statsmodels>=0.13.0
 yfinance
 requests
 alpaca-py
+aiohttp
+asyncio
 
 # Telemetry & Dashboard Interface
 streamlit

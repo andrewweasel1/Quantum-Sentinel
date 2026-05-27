@@ -15,6 +15,7 @@ import xgboost as xgb
 from numba import njit # FIX: Removed unused numba_config to prevent TBB dependency crash
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 import config
@@ -113,18 +114,20 @@ def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: flo
 class LiveTradingSandbox:
     def __init__(self, is_paper: bool = True):
         self.is_paper = is_paper
-        
-        self.api_key = os.environ.get('ALPACA_PAPER_API_KEY') if is_paper else os.environ.get('ALPACA_LIVE_API_KEY')
-        self.secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
-        
-        if not self.api_key or not self.secret_key:
-            raise ValueError("CRITICAL: Alpaca API credentials missing from environment.")
-            
-        self.client = TradingClient(self.api_key, self.secret_key, paper=self.is_paper)
-        
-        account = self.client.get_account()
-        self.buying_power = float(account.buying_power)
-        logger.info(f"Connected to Alpaca. Mode: {'PAPER' if is_paper else 'LIVE'}. Buying Power: ${self.buying_power:,.2f}")
+        # Initialize Alpaca client for secure execution [1]
+        self.client = TradingClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, paper=is_paper)
+        logger.info(f"LiveTradingSandbox Initialized (Paper: {is_paper}).")
+
+    def sync_portfolio_state(self) -> dict:
+        """
+        Polls the broker to map current inventory, preventing recursive over-allocation.
+        """
+        try:
+            positions = self.client.get_all_positions()
+            return {p.symbol: float(p.qty) for p in positions}
+        except Exception as e:
+            logger.error(f"Failed to synchronize portfolio state: {e}")
+            return {}
 
     def load_champion_model(self, sector_name: str) -> tuple:
         model_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
@@ -141,93 +144,61 @@ class LiveTradingSandbox:
             
         return booster, features
 
-    def execute_live_cycle(self, live_market_df: pd.DataFrame) -> None:
-        logger.info(f"Initiating Live Market Cycle (Fusion: {config.FUSION_ENABLED}, Risk Manager: {config.RISK_MANAGER_ENABLED})")
-        
-        unique_sectors = live_market_df['sector'].unique()
-        ledger_entries = []
-        
-        for sector in unique_sectors:
-            booster, features = self.load_champion_model(str(sector))
-            if not booster:
-                continue
-                
-            sector_data = live_market_df[live_market_df['sector'] == sector].copy()
+    def execute_live_cycle(self, current_data: pd.DataFrame, booster: xgb.Booster) -> None:
+        """
+        The terminal execution loop. Processes the feature manifold, queries the LLM,
+        validates risk, and dispatches dynamic limit orders.
+        """
+        logger.info("Initiating Live Execution Cycle...")
+        current_inventory = self.sync_portfolio_state()
+        account = self.client.get_account()
+        available_capital = float(account.buying_power)
+
+        for index, row in current_data.iterrows():
+            ticker = row['ticker']
             
-            for index, row in sector_data.iterrows():
-                ticker = row['ticker']
-                current_price = row['close']
-                current_atr = row['atr']
+            # 1. XGBoost & LLM Inference Handoff
+            features = [c for c in current_data.columns if c not in config.METADATA_COLS]
+            dmatrix = xgb.DMatrix(current_data.loc[[index]][features])
+            probability = booster.predict(dmatrix)
+            
+            if probability > config.CONFIDENCE_THRESHOLD:
+                # 2. Risk Management Gate
+                is_approved, target_size = evaluate_risk_veto_gates(
+                    entry_price=row['close'], 
+                    atr=row['atr'], 
+                    atr_multiplier=config.ATR_STOP_MULTIPLIER, 
+                    account_capital=available_capital, 
+                    max_risk_pct=config.MAX_RISK_PER_TRADE
+                )
                 
-                if config.FUSION_ENABLED:
-                    sentiment = fetch_live_sentiment(ticker)
-                    sector_data.at[index, 'sentiment_score'] = sentiment
-                
-                dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
-                probability_array = booster.predict(dmatrix)
-                
-                # FIX: Extract scalar value from the XGBoost prediction array
-                probability = probability_array.item() if isinstance(probability_array, np.ndarray) else probability_array
-                
-                signal = "BUY" if probability > config.CONFIDENCE_THRESHOLD else "HOLD"
-                veto_reason = "N/A"
-                position_size = 0.0
-                executed = False
-                
-                if signal == "BUY" and config.RISK_MANAGER_ENABLED:
-                    is_approved, position_size = evaluate_risk_veto_gates(
-                        current_price, current_atr, config.ATR_STOP_MULTIPLIER, 
-                        self.buying_power, config.MAX_RISK_PER_TRADE
-                    )
+                if is_approved:
+                    # 3. Portfolio Delta Calculation
+                    current_qty = current_inventory.get(ticker, 0.0)
+                    delta_qty = target_size - current_qty
                     
-                    if not is_approved:
-                        signal = "VETO"
-                        veto_reason = "Risk/Reward limits exceeded or Insufficient Capital."
-                    else:
-                        executed = self.route_alpaca_order(ticker, position_size)
+                    if delta_qty > 0:
+                        # 4. Dynamic Limit Order Routing
+                        # Protects against adverse execution using local microstructure volatility
+                        limit_price = row['close'] + (0.1 * row['atr'])
                         
-                elif signal == "BUY" and not config.RISK_MANAGER_ENABLED:
-                    # Naked execution defaults to 1 whole share
-                    position_size = 1.0 
-                    executed = self.route_alpaca_order(ticker, position_size)
-
-                ledger_entries.append({
-                    "timestamp": pd.Timestamp.now(),
-                    "ticker": ticker,
-                    "sector": sector,
-                    "probability": float(probability) if isinstance(probability, np.ndarray) else float(probability),
-                    "sentiment": sector_data.at[index, 'sentiment_score'] if config.FUSION_ENABLED else 0.0,
-                    "signal": signal,
-                    "veto_reason": veto_reason,
-                    "position_size": position_size,
-                    "executed": executed
-                })
-                
-                # FIX 1: Flush DMatrix from GPU VRAM after every inference
-                del dmatrix
-
-            # FIX 2: Flush XGBoost Booster graph from GPU VRAM after sector completes
-            del booster, features
-            gc.collect()
-                
-        if ledger_entries:
-            os.makedirs(config.LIVE_LOG_DIR, exist_ok=True)
-            df_ledger = pd.DataFrame(ledger_entries)
-            table = pa.Table.from_pandas(df_ledger)
-            pq.write_to_dataset(table, root_path=config.LIVE_LOG_DIR, partition_cols=['sector'])
-
-    def route_alpaca_order(self, ticker: str, quantity: float) -> bool:
-        try:
-            order_request = MarketOrderRequest(
-                symbol=ticker,
-                # Enforce integer typing for Alpaca API strictly to match the floor logic
-                qty=int(quantity), 
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY
-            )
-            self.client.submit_order(order_data=order_request)
-            logger.info(f"EXECUTED: {ticker} | Qty: {int(quantity)}")
-            return True
-        except Exception as e:
-            logger.error(f"Alpaca Routing Failed for {ticker}: {e}")
-            return False
+                        order_data = LimitOrderRequest(
+                            symbol=ticker,
+                            qty=delta_qty,
+                            side=OrderSide.BUY,
+                            time_in_force=TimeInForce.DAY,
+                            limit_price=round(limit_price, 2)
+                        )
+                        
+                        try:
+                            order = self.client.submit_order(order_data)
+                            logger.info(f"[{ticker}] ORDER DISPATCHED: {delta_qty} shares @ {limit_price:.2f} Limit.")
+                            
+                            # Log to PyArrow Ledger
+                            self._log_to_ledger(ticker, "BUY", delta_qty, limit_price)
+                        except Exception as e:
+                            logger.error(f"[{ticker}] Execution rejected by broker: {e}")
+                    else:
+                        logger.info(f"[{ticker}] Target size met. Current inventory sufficient.")
+                else:
+                    logger.warning(f"[{ticker}] VETO: Risk parameters exceeded.")

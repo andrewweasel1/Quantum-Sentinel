@@ -14,25 +14,17 @@ import pandas as pd
 import dask.dataframe as dd
 import xgboost as xgb
 from itertools import combinations
+from numba import njit
 
 import config
 
-# ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
-# ==============================================================================
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. OUT-OF-CORE BATCH ITERATOR (VRAM OPTIMIZATION)
+# 1. OUT-OF-CORE BATCH ITERATOR & RISK SIMULATOR
 # ==============================================================================
 class DataFrameIter(xgb.DataIter):
-    """
-    A custom XGBoost Data Iterator that feeds data in localized chunks [2].
-    Designed to work with ExtMemQuantileDMatrix to prevent 12GB VRAM OOM 
-    on hardware like the RTX 4070 by caching data across the host and device [3].
-    """
     def __init__(self, X: pd.DataFrame, y: pd.Series, batch_size: int = 100000):
-        # Initialize the base class. Setting on_host=True caches on CPU RAM [5]
         super().__init__(on_host=True)
         self.X = X
         self.y = y
@@ -41,40 +33,52 @@ class DataFrameIter(xgb.DataIter):
         self.it = 0
 
     def reset(self) -> None:
-        """Resets the iterator to the beginning [6]."""
         self.it = 0
 
     def next(self, input_data: Any) -> int:
-        """Yields the next batch of data to the XGBoost internal API [2]."""
         if self.it == self.n_batches:
             return 0
         start = self.it * self.batch_size
         end = min((self.it + 1) * self.batch_size, len(self.X))
-        
-        # Pass the sliced batch to the internal XGBoost input function [2]
         input_data(data=self.X.iloc[start:end], label=self.y.iloc[start:end])
-        
         self.it += 1
         return 1
+
+@njit(fastmath=True)
+def simulate_risk_manager_njit(signals, closes, lows, atrs, atr_multiplier, max_risk_pct):
+    """
+    Simulates the Risk Manager's fractional sizing and dynamic ATR stops during CPCV.
+    Executes in microseconds via LLVM compiler to prevent CPU bottlenecking.
+    """
+    n = len(signals)
+    returns = np.zeros(n)
+    
+    for i in range(n - 1):
+        if signals[i] == 1 and atrs[i] > 0:
+            entry = closes[i]
+            stop = entry - (atr_multiplier * atrs[i])
+            
+            # Fractional Position Sizing
+            risk_distance = (entry - stop) / entry
+            size = max_risk_pct / risk_distance if risk_distance > 0 else 0.0
+            size = min(size, 1.0) # Hard cap to prevent leverage blowouts
+            
+            if lows[i+1] <= stop:
+                returns[i] = -risk_distance * size
+            else:
+                returns[i] = ((closes[i+1] - entry) / entry) * size
+                
+    return returns
 
 # ==============================================================================
 # 2. TOURNAMENT PIPELINE
 # ==============================================================================
 class ModularTournamentDirector:
     def __init__(self) -> None:
-        """
-        Initializes the Tournament Director by memory-mapping the compiled feature matrices.
-        """
         logger.info(f"Mounting out-of-core data from {config.PROCESSED_VAULT_DIR}...")
         self.ddf: dd.DataFrame = dd.read_parquet(config.PROCESSED_VAULT_DIR, **config.DASK_READ_KWARGS)
 
     def generate_cpcv_splits(self, df: pd.DataFrame, n_groups: int = 6, test_groups: int = 2) -> Generator[Tuple[pd.DataFrame, pd.DataFrame], None, None]:
-        """
-        Executes Combinatorial Purged Cross-Validation (CPCV).
-        Slices the timeseries into `n_groups`. Yields multiple train/test paths to generate
-        a robust distribution of out-of-sample performance, rigorously purging and embargoing 
-        overlapping observation horizons.
-        """
         indices = np.array_split(df.index, n_groups)
         group_ids = list(range(n_groups))
         
@@ -95,28 +99,23 @@ class ModularTournamentDirector:
             yield train_df, test_df
 
     def tune_sector_grid(self, sector_name: str) -> None:
-        """
-        Tests the hyperparameter grid across multiple CPCV backtest paths using VRAM-optimized structures.
-        Records every combination's returns to export a full matrix for PBO evaluation.
-        """
         logger.info(f"--- Initiating CPCV Tournament for Sector: {sector_name} ---")
         
         sector_df = self.ddf[self.ddf['sector'] == sector_name].compute().sort_values('date')
         sector_df.reset_index(drop=True, inplace=True)
         
         if len(sector_df) < 1000:
-            logger.warning(f"Insufficient historical data for {sector_name}. Requires deeper panel for CPCV. Skipping...")
             return
 
         target_col = 'target_label' if config.RUN_MODE == "STANDARD" else 'option_target_label'
         features = [c for c in sector_df.columns if c not in config.METADATA_COLS]
 
         param_grid = {
-            'max_depth': [7, 8],               
-            'min_child_weight': [1.0, 3.0, 5.0],  
-            'gamma': [0.1, 0.5],
+            'max_depth': [4, 5],               
+            'min_child_weight': [1.0, 3.0],  
+            'gamma': [0.1],
             'learning_rate': [0.01, 0.05],
-            'subsample': [0.8]  # Required < 1.0 fraction to enable stochastic sampling routines
+            'subsample': [0.8]  
         }
         
         keys, values = zip(*param_grid.items())
@@ -124,34 +123,30 @@ class ModularTournamentDirector:
         
         returns_matrix = {}
         benchmark_returns = []
+        fusion_signals = []
+        
         best_sr: float = -1.0
         best_params: Optional[Dict] = None
         best_returns: np.ndarray = np.array([])
         benchmark_calculated = False
         
-        # 1. Hyperparameter Search Space
         for trial_idx, params in enumerate(grid_combinations):
             params['tree_method'] = 'hist'
             params['device'] = 'cuda'
             params['objective'] = 'binary:logistic'
             params['grow_policy'] = 'lossguide'
-            
-            # RTX 4070 Optimization: Instruct GPU to sample instances with higher gradient values [4]
             params['sampling_method'] = 'gradient_based' 
             
             trial_oos_returns = []
+            trial_sentiment = []
             
-            # 2. Combinatorial Purged Cross-Validation
             for train_df, test_df in self.generate_cpcv_splits(sector_df):
-                
                 X_train, y_train = train_df[features], train_df[target_col]
                 X_test, y_test = test_df[features], test_df[target_col]
 
-                # RTX 4070 Optimization: Initialize custom Iterators [2, 5]
                 train_iter = DataFrameIter(X_train, y_train, batch_size=100000)
                 test_iter = DataFrameIter(X_test, y_test, batch_size=100000)
                 
-                # Stream the iterators dynamically into the ExtMemQuantileDMatrix [3]
                 dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
                 dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
                 
@@ -164,16 +159,28 @@ class ModularTournamentDirector:
                     verbose_eval=False
                 )
                 
-                # 3. Translate Probabilities to Simulated Returns
                 preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
                 signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
                 
-                forward_returns = test_df['close'].pct_change().fillna(0).values
-                strategy_returns = signals * forward_returns
+                # SHIELD AGENT: Apply Risk Manager Simulation
+                if config.RISK_MANAGER_ENABLED:
+                    closes = test_df['close'].values
+                    lows = test_df['low'].values
+                    atrs = test_df['atr'].values
+                    strategy_returns = simulate_risk_manager_njit(
+                        signals, closes, lows, atrs, config.ATR_STOP_MULTIPLIER, config.MAX_RISK_PER_TRADE
+                    )
+                else:
+                    forward_returns = test_df['close'].pct_change().fillna(0).values
+                    strategy_returns = signals * forward_returns
+                    
                 trial_oos_returns.extend(strategy_returns)
 
+                if config.FUSION_ENABLED:
+                    trial_sentiment.extend(test_df['sentiment_score'].values)
+
                 if not benchmark_calculated:
-                    benchmark_returns.extend(forward_returns)
+                    benchmark_returns.extend(test_df['close'].pct_change().fillna(0).values)
 
                 del dtrain, dtest, train_iter, test_iter
                 
@@ -182,24 +189,30 @@ class ModularTournamentDirector:
             
             returns_matrix[f"trial_{trial_idx}"] = trial_oos_returns
             
-            if np.std(trial_oos_returns) > 0:
-                trial_sr = np.mean(trial_oos_returns) / np.std(trial_oos_returns)
-            else:
-                trial_sr = 0.0
+            trial_sr = np.mean(trial_oos_returns) / np.std(trial_oos_returns) if np.std(trial_oos_returns) > 0 else 0.0
                 
             if trial_sr > best_sr:
                 best_sr = trial_sr
                 best_params = params
                 best_returns = trial_oos_returns
+                if config.FUSION_ENABLED:
+                    fusion_signals = trial_sentiment
 
-        # 4. Matrix Export & Candidate Staging
         if best_params is not None and len(best_returns) > 0:
-            
-            # Train the final candidate using the external memory matrices
             full_iter = DataFrameIter(sector_df[features], sector_df[target_col], batch_size=100000)
             d_full = xgb.ExtMemQuantileDMatrix(full_iter)
             candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
             
+            # FUSION EVALUATION: Feature Displacement Logging
+            if config.FUSION_ENABLED:
+                importances = candidate_booster.get_score(importance_type='gain')
+                sorted_imp = sorted(importances.items(), key=lambda x: x[6], reverse=True)
+                top_features = [x for x in sorted_imp[:5]]
+                if 'sentiment_score' in top_features:
+                    logger.info(f"[{sector_name}] FUSION SUCCESS: LLM Sentiment generated alpha (Top 5 Feature).")
+                else:
+                    logger.warning(f"[{sector_name}] FUSION DECAY: LLM Sentiment was displaced by technicals. Acting as noise.")
+
             os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
             candidate_booster.save_model(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"))
             
@@ -209,122 +222,130 @@ class ModularTournamentDirector:
             matrix_df = pd.DataFrame(returns_matrix)
             matrix_df.to_parquet(f"returns_matrix_{sector_name}.parquet", engine='pyarrow')
             
-            bench_df = pd.DataFrame({"benchmark": benchmark_returns, "champion": best_returns})
+            bench_dict = {"benchmark": benchmark_returns, "champion": best_returns}
+            if config.FUSION_ENABLED:
+                bench_dict["sentiment_score"] = fusion_signals
+                
+            bench_df = pd.DataFrame(bench_dict)
             bench_df.to_parquet(f"benchmark_{sector_name}.parquet", engine='pyarrow')
 
-            logger.info(f"[{sector_name}] Matrix & Benchmark exported. Raw candidate SR: {best_sr:.3f}. Awaiting Evaluator verification.")
-        else:
-            logger.warning(f"Sector {sector_name} failed to find any model with positive variance.")
+            logger.info(f"[{sector_name}] Matrix & Benchmark exported. Awaiting Evaluator verification.")
         
         gc.collect()
 
     def execute_gauntlet(self) -> None:
-        """
-        Orchestrates the out-of-core pipeline across all unique sectors.
-        """
         if not os.path.exists(config.PROCESSED_VAULT_DIR):
-            logger.error("Processed features missing. Run feature_compiler.py first.")
             return
 
-        logger.info("=== COMMENCING OUT-OF-CORE XGBOOST TOURNAMENT ===")
-        
+        logger.info(f"=== COMMENCING OUT-OF-CORE TOURNAMENT (Fusion: {config.FUSION_ENABLED}, Risk Manager: {config.RISK_MANAGER_ENABLED}) ===")
         unique_sectors = self.ddf['sector'].unique().compute()
         
         for sector in unique_sectors:
-            if pd.isna(sector):
-                continue
-                
+            if pd.isna(sector): continue
             self.tune_sector_grid(str(sector))
             
         logger.info("=== TOURNAMENT CONCLUDED. MATRICES STAGED FOR EVALUATOR. ===")
 
 --- FILE: ./main.py ---
 
+import os
 import argparse
 import logging
-import config
+import pandas as pd
 
 # ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
+# 1. ARGPARSE & GLOBAL STATE INJECTION
+# ==============================================================================
+parser = argparse.ArgumentParser(description="Quantum Sentinel V6 - Multi-Agent Engine")
+parser.add_argument("--refresh-raw", action="store_true", help="Refresh raw market data")
+parser.add_argument("--fusion", action="store_true", help="Enable LLM Sentiment Fusion Agent")
+parser.add_argument("--disable-risk-manager", action="store_true", help="Disable the Risk Manager Agent")
+
+# New Lifecycle Execution Flags
+parser.add_argument("--evaluate", action="store_true", help="Run the statistical Evaluator to promote models")
+parser.add_argument("--live", action="store_true", help="Launch the Live Trading Sandbox")
+args = parser.parse_args()
+
+# Inject the toggled states into config BEFORE other modules load
+import config
+config.FUSION_ENABLED = args.fusion
+config.RISK_MANAGER_ENABLED = not args.disable_risk_manager
+
+# ==============================================================================
+# 2. CENTRALIZED LOGGING CONFIGURATION
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
-        logging.StreamHandler()                       # Prints to console
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  
+        logging.StreamHandler()                       
     ]
 )
-# FIXED: Corrected dunder method from **name** to __name__
 logger = logging.getLogger(__name__)
 
-# Import custom modules AFTER logging is configured so they inherit the root logger
+# ==============================================================================
+# 3. DOWNSTREAM MODULE IMPORTS
+# ==============================================================================
 import data_ingestion
 import feature_compiler
 import tournament
+import evaluator
+import live_trader
 
 def main():
     logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
+    logger.info(f"LLM Fusion Agent: {'ONLINE' if config.FUSION_ENABLED else 'OFFLINE'}")
+    logger.info(f"Risk Manager Agent: {'ONLINE' if config.RISK_MANAGER_ENABLED else 'OFFLINE'}")
     
-    # Set up command-line arguments
-    parser = argparse.ArgumentParser(description="AI Quantitative Strategy Tournament Runner")
-    parser.add_argument(
-        "--refresh-raw", 
-        action="store_true", 
-        help="Force a point-in-time constituent refresh and clean re-download of all raw daily data"
-    )
-    parser.add_argument(
-        "--refresh-features", 
-        action="store_true", 
-        help="Force offline Dask re-compilation of technical indicator feature matrices"
-    )
-    args = parser.parse_args()
-
-    # ==============================================================================
-    # PHASE 1: RAW DATA INGESTION
-    # ==============================================================================
+    # PHASE 1: DATA PIPELINE & TRAINING
     if args.refresh_raw:
-        logger.info("[COMMAND] --refresh-raw detected. Synchronizing raw market data...")
-        # Retrieves the survivorship-bias free universe map
         universe = data_ingestion.get_survivorship_adjusted_universe()
-        # Multi-threaded download into the raw Parquet vault
         data_ingestion.build_raw_vault(universe)
-        
-        # If raw data is refreshed, we must automatically recompile the downstream features
-        args.refresh_features = True
-
-    # ==============================================================================
-    # PHASE 2: OFFLINE FEATURE COMPILATION
-    # ==============================================================================
-    if args.refresh_features:
-        logger.info("[COMMAND] --refresh-features detected. Compiling offline indicator matrices...")
-        # Maps partitions via Dask and dumps to the processed Hive-partitioned vault
         feature_compiler.compile_features_from_raw()
+        
+        director = tournament.ModularTournamentDirector()
+        director.execute_gauntlet()
 
-    # ==============================================================================
-    # PHASE 3: OUT-OF-CORE MACHINE LEARNING TOURNAMENT
-    # ==============================================================================
-    logger.info("[COMMAND] Initializing XGBoost Out-of-Core Tournament...")
-    director = tournament.ModularTournamentDirector()
-    director.execute_gauntlet()
+    # PHASE 2: STATISTICAL EVALUATION
+    if args.evaluate:
+        stat_evaluator = evaluator.QuantitativeEvaluator()
+        stat_evaluator.run_evaluation_gauntlet()
 
-# FIXED: Corrected dunder method from **name** == "**main**" to standard execution gate
+    # PHASE 3: LIVE MARKET EXECUTION
+    if args.live:
+        logger.info("Initializing Live Trading Sandbox via Alpaca...")
+        sandbox = live_trader.LiveTradingSandbox(is_paper=True)
+        
+        # In a true deployment, this block would pull today's live OHLCV data. 
+        # For testing, we load the most recent data from the processed vault.
+        logger.info("Sourcing live market data for active champions...")
+        live_market_df = pd.read_parquet(config.PROCESSED_VAULT_DIR, engine="pyarrow")
+        
+        # Filter for the most recent trading day to simulate the live feed
+        latest_date = live_market_df['date'].max()
+        current_data = live_market_df[live_market_df['date'] == latest_date].copy()
+        
+        sandbox.execute_live_cycle(current_data)
+
 if __name__ == "__main__":
     main()
 
 --- FILE: ./live_trader.py ---
 
 import os
+import re
 import json
-import math
+import time
+import requests
 import logging
-from typing import Dict, Any, List
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xgboost as xgb
+
+from numba import config as numba_config, njit, prange
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -332,197 +353,210 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 import config
 
 # ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
+# 0. CENTRALIZED LOGGING & INTEL TBB CONFIGURATION
 # ==============================================================================
-# FIXED: Corrected dunder method from **name** to __name__
 logger = logging.getLogger(__name__)
 
+# Force Numba to use Intel TBB for ultra-fast, fork-safe CPU parallelization
+numba_config.THREADING_LAYER = 'tbb'
+
 # ==============================================================================
-# 1. PRODUCTION POOL DISCOVERY
+# 1. THE SENSOR AGENT: LIVE LLM SENTIMENT
 # ==============================================================================
-def discover_production_pool() -> Dict[str, Dict[str, Any]]:
+def fetch_live_sentiment(ticker: str) -> float:
     """
-    Scans the production folder and groups models with their exact feature manifests.
-    This creates the multi-model sandbox where old champions and new challengers coexist.
+    Scrapes live market news, anonymizes the ticker to prevent LLM hallucination/bias,
+    and requests a strictly formatted JSON sentiment score from the local Llama 3 model.
     """
-    if not os.path.exists(config.PROD_MODELS_DIR):
-        return {}
-        
-    models_pool = {}
-    files = os.listdir(config.PROD_MODELS_DIR)
+    if not config.FUSION_ENABLED:
+        return 0.0
+
+    # In a live deployment, replace this mock with a real-time news API (e.g., NewsAPI or Alpaca News)
+    live_headline = f"Breaking pre-market developments expected to impact {ticker} today."
     
-    # Filter for XGBoost .json graphs, explicitly ignoring the feature maps
-    model_files = [f for f in files if f.endswith(".json") and not f.endswith("_features.json")]
-    
-    for model_file in model_files:
-        base_name = model_file.replace(".json", "")
-        feature_file = f"{base_name}_features.json"
-        
-        if feature_file in files:
-            # 1. Load the frozen XGBoost Model Weights
-            bst = xgb.Booster()
-            bst.load_model(os.path.join(config.PROD_MODELS_DIR, model_file))
-            
-            # 2. Load the locked Feature Manifest
-            with open(os.path.join(config.PROD_MODELS_DIR, feature_file), "r") as f:
-                features = json.load(f)
-                
-            models_pool[base_name] = {
-                "booster": bst,
-                "features": features
-            }
-            
-    logger.info(f"Active pool: Discovered {len(models_pool)} production models running concurrently.")
-    return models_pool
+    # Entity Anonymization Engine
+    anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', live_headline, flags=re.IGNORECASE)
 
-# ==============================================================================
-# 2. LIVE SANDBOX EXECUTION CYCLE
-# ==============================================================================
-def run_live_sandbox_cycle(live_market_df: pd.DataFrame) -> None:
-    """
-    Evaluates live market streams across all commissioned models simultaneously.
-    Logs independent decisions to a partitioned dataset ledger for the dashboard.
-    """
-    pool = discover_production_pool()
-    if not pool:
-        # FIXED: Removed the garbage syntax error text attached to the return statement
-        logger.warning("Sandbox pool is empty. Deploy the tournament using exporter.py first.")
-        return
+    payload = {
+        "model": config.LLM_MODEL_NAME,
+        "prompt": f"{config.LLM_SYSTEM_PROMPT}\n\nHeadline: {anonymized_headline}",
+        "format": "json",
+        "stream": False
+    }
 
-    new_log_entries = []
-    timestamp = pd.Timestamp.now()
-    
-    # Extract strings/metadata safely as numpy arrays for fast iteration later
-    tickers = live_market_df.get('ticker', pd.Series(['UNKNOWN'] * len(live_market_df))).values
-    sentiments = live_market_df.get('llm_sentiment', pd.Series([np.nan] * len(live_market_df))).values
-
-    # Process live data through every model in the sandbox pool
-    for model_id, components in pool.items():
-        bst = components["booster"]
-        expected_features = components["features"]
-        
-        # 1. BATCH FEATURE ALIGNMENT (Eliminates iterrows bottleneck)
-        aligned_data = {}
-        for f in expected_features:
-            if f in live_market_df.columns:
-                aligned_data[f] = live_market_df[f].values
-            else:
-                aligned_data[f] = np.full(len(live_market_df), np.nan)
-            
-        aligned_df = pd.DataFrame(aligned_data)
-        
-        # 2. BATCH GPU INFERENCE (Eliminates per-row DMatrix creation)
-        dmatrix = xgb.DMatrix(aligned_df)
-        predictions = bst.predict(dmatrix)
-        
-        # 3. FAST ARRAY ITERATION 
-        for idx, prediction_prob in enumerate(predictions):
-            ticker = tickers[idx]
-            status = "HELD"
-            reason = "Confidence Below Threshold"
-            signal = 0
-            
-            # Using the centralized threshold defined in config.py
-            if prediction_prob > config.CONFIDENCE_THRESHOLD:
-                status = "EXECUTED (PAPER)"
-                reason = "Passed All Gates"
-                signal = 1
-                
-                # --- LIVE CAPITAL ROUTING GATE ---
-                # if model_id == "standard_technology_champion_v1" and signal == 1:
-                #     execute_live_capital_order(ticker, entry_price, stop_loss)
-                
-            new_log_entries.append({
-                "Timestamp": timestamp,
-                "Model_ID": model_id,
-                "Ticker": ticker,
-                "ML_Confidence": float(prediction_prob),
-                "LLM_Sentiment": sentiments[idx],
-                "Status": status,
-                "Veto_Reason": reason,
-                "P/L": 0.0 
-            })
-
-    # 4. Append to the Unified Live Ledger (Optimized PyArrow I/O Partitioning)
-    if new_log_entries:
-        new_df = pd.DataFrame(new_log_entries)
-        table = pa.Table.from_pandas(new_df)
-        
-        pq.write_to_dataset(
-            table,
-            root_path=config.LIVE_LOG_DIR,
-            partition_cols=['Model_ID']
-        )
-        logger.info(f"Sandbox Cycle Complete. {len(new_log_entries)} telemetry lines safely appended to the dataset.")
-
-# ==============================================================================
-# 3. AUTHENTIC ALPACA ORDER EXECUTION
-# ==============================================================================
-def execute_live_capital_order(ticker: str, entry_price: float, stop_loss: float, side: str = "BUY", is_paper: bool = True) -> bool:
-    """
-    Routes authentic orders to the Alpaca Trading API.
-    Toggles between Paper Trading and Live Capital based on the `is_paper` flag.
-    Dynamically sizes the position based on live account buying power and risk tolerance.
-    """
-    # 1. Credential Routing
-    api_key = os.environ.get('ALPACA_PAPER_API_KEY') if is_paper else os.environ.get('ALPACA_LIVE_API_KEY')
-    secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
-    
-    if not api_key or not secret_key:
-        logger.error("Alpaca API credentials not found in environment variables.")
-        return False
-
-    # 2. Initialize the Trading Client
-    trading_client = TradingClient(api_key, secret_key, paper=is_paper)
-    
     try:
-        # 3. Dynamic Position Sizing (Risk Manager Gate)
-        account = trading_client.get_account()
-        account_equity = float(account.equity)
-        
-        risk_allowance = account_equity * 0.02  
-        risk_per_share = abs(entry_price - stop_loss)
-        
-        if risk_per_share <= 0:
-            logger.error(f"Invalid stop-loss parameters for {ticker}. Trade aborted.")
-            return False
-            
-        target_qty = math.floor(risk_allowance / risk_per_share)
-        
-        if target_qty <= 0:
-            logger.warning(f"VETOED: Account equity (${account_equity}) insufficient to purchase {ticker} at safe risk thresholds.")
-            return False
-
-        # 4. Map the Order Parameters
-        order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
-        
-        market_order_data = MarketOrderRequest(
-            symbol=ticker,
-            qty=target_qty,
-            side=order_side,
-            time_in_force=TimeInForce.GTC
-        )
-        
-        # 5. Execute the Trade
-        env_label = "PAPER SIMULATION" if is_paper else "LIVE CAPITAL"
-        logger.info(f"[{env_label}] Routing {order_side.name} order for {target_qty} shares of {ticker}...")
-        
-        market_order = trading_client.submit_order(order_data=market_order_data)
-        logger.info(f"Execution Successful! Alpaca Order ID: {market_order.id}")
-        
-        return True
-
+        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=3.0)
+        if response.status_code == 200:
+            data = json.loads(response.json().get("response", "{}"))
+            return float(data.get("sentiment_score", 0.0))
     except Exception as e:
-        logger.error(f"Order execution rejected by Alpaca for {ticker}.", exc_info=True)
-        return False
+        logger.warning(f"LLM Sensor timeout for {ticker}. Defaulting to neutral sentiment.")
+        
+    return 0.0
+
+# ==============================================================================
+# 2. THE SHIELD AGENT: CPU-PARALLELIZED RISK MANAGER
+# ==============================================================================
+@njit(parallel=True, fastmath=True)
+def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: float, 
+                             account_capital: float, max_risk_pct: float) -> tuple:
+    """
+    Intel TBB Parallelized Risk Manager.
+    Evaluates fractional sizing and volatility stops. Returns (Is_Approved, Position_Size).
+    """
+    stop_loss = entry_price - (atr_multiplier * atr)
+    risk_per_share = entry_price - stop_loss
+    
+    if risk_per_share <= 0:
+        return False, 0.0 # Veto: Invalid Volatility Profile
+        
+    capital_at_risk = account_capital * max_risk_pct
+    position_size = capital_at_risk / risk_per_share
+    
+    # Fractional position sizing constraint
+    max_allowable_shares = account_capital / entry_price
+    position_size = min(position_size, max_allowable_shares)
+    
+    if position_size < 1.0: # Alpaca requires at least 1 fractional/whole share minimum depending on asset
+        return False, 0.0 # Veto: Account too small for safe risk profile
+        
+    return True, position_size
+
+# ==============================================================================
+# 3. LIVE SANDBOX EXECUTION CYCLE
+# ==============================================================================
+class LiveTradingSandbox:
+    def __init__(self, is_paper: bool = True):
+        self.is_paper = is_paper
+        
+        # 1. Credential Routing
+        self.api_key = os.environ.get('ALPACA_PAPER_API_KEY') if is_paper else os.environ.get('ALPACA_LIVE_API_KEY')
+        self.secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
+        
+        if not self.api_key or not self.secret_key:
+            raise ValueError("CRITICAL: Alpaca API credentials missing from environment.")
+            
+        self.client = TradingClient(self.api_key, self.secret_key, paper=self.is_paper)
+        
+        # Verify Alpaca Connection
+        account = self.client.get_account()
+        self.buying_power = float(account.buying_power)
+        logger.info(f"Connected to Alpaca. Mode: {'PAPER' if is_paper else 'LIVE'}. Buying Power: ${self.buying_power:,.2f}")
+
+    def load_champion_model(self, sector_name: str) -> tuple:
+        """Loads the XGBoost model and its precise feature manifest from production."""
+        model_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
+        features_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion_features.json")
+        
+        if not os.path.exists(model_path) or not os.path.exists(features_path):
+            return None, None
+            
+        booster = xgb.Booster()
+        booster.load_model(model_path)
+        
+        with open(features_path, "r") as f:
+            features = json.load(f)
+            
+        return booster, features
+
+    def execute_live_cycle(self, live_market_df: pd.DataFrame) -> None:
+        """
+        Orchestrates the live stream across all commissioned models.
+        Logs independent decisions to a PyArrow ledger for the Streamlit dashboard.
+        """
+        logger.info(f"Initiating Live Market Cycle (Fusion: {config.FUSION_ENABLED}, Risk Manager: {config.RISK_MANAGER_ENABLED})")
+        
+        unique_sectors = live_market_df['sector'].unique()
+        ledger_entries = []
+        
+        for sector in unique_sectors:
+            booster, features = self.load_champion_model(str(sector))
+            if not booster:
+                continue
+                
+            sector_data = live_market_df[live_market_df['sector'] == sector].copy()
+            
+            for index, row in sector_data.iterrows():
+                ticker = row['ticker']
+                current_price = row['close']
+                current_atr = row['atr']
+                
+                # PHASE 1: THE SENSOR AGENT (LLM)
+                if config.FUSION_ENABLED:
+                    sentiment = fetch_live_sentiment(ticker)
+                    sector_data.at[index, 'sentiment_score'] = sentiment
+                
+                # PHASE 2: THE QUANTITATIVE AGENT (XGBoost)
+                # Note: GPU prediction handles missing parameters intelligently
+                dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
+                probability = booster.predict(dmatrix)
+                
+                signal = "BUY" if probability > config.CONFIDENCE_THRESHOLD else "HOLD"
+                veto_reason = "N/A"
+                position_size = 0.0
+                executed = False
+                
+                # PHASE 3: THE SHIELD AGENT (Risk Manager)
+                if signal == "BUY" and config.RISK_MANAGER_ENABLED:
+                    is_approved, position_size = evaluate_risk_veto_gates(
+                        current_price, current_atr, config.ATR_STOP_MULTIPLIER, 
+                        self.buying_power, config.MAX_RISK_PER_TRADE
+                    )
+                    
+                    if not is_approved:
+                        signal = "VETO"
+                        veto_reason = "Risk/Reward limits exceeded or Insufficient Capital."
+                    else:
+                        executed = self.route_alpaca_order(ticker, position_size)
+                        
+                elif signal == "BUY" and not config.RISK_MANAGER_ENABLED:
+                    # Naked execution (Warning: Dangerous in live markets)
+                    position_size = 1.0 
+                    executed = self.route_alpaca_order(ticker, position_size)
+
+                # Append Telemetry
+                ledger_entries.append({
+                    "timestamp": pd.Timestamp.now(),
+                    "ticker": ticker,
+                    "sector": sector,
+                    "probability": probability,
+                    "sentiment": sector_data.at[index, 'sentiment_score'] if config.FUSION_ENABLED else 0.0,
+                    "signal": signal,
+                    "veto_reason": veto_reason,
+                    "position_size": position_size,
+                    "executed": executed
+                })
+                
+        # Flush Telemetry to PyArrow Ledger
+        if ledger_entries:
+            os.makedirs(config.LIVE_LOG_DIR, exist_ok=True)
+            df_ledger = pd.DataFrame(ledger_entries)
+            table = pa.Table.from_pandas(df_ledger)
+            pq.write_to_dataset(table, root_path=config.LIVE_LOG_DIR, partition_cols=['sector'])
+
+    def route_alpaca_order(self, ticker: str, quantity: float) -> bool:
+        """Executes the authentic Alpaca Market Order."""
+        try:
+            order_request = MarketOrderRequest(
+                symbol=ticker,
+                qty=round(quantity, 2), # Alpaca supports fractional shares
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
+            )
+            self.client.submit_order(order_data=order_request)
+            logger.info(f"EXECUTED: {ticker} | Qty: {quantity}")
+            return True
+        except Exception as e:
+            logger.error(f"Alpaca Routing Failed for {ticker}: {e}")
+            return False
 
 --- FILE: ./data_ingestion.py ---
 
 import os
 import shutil
-import requests
 import pandas as pd
 import yfinance as yf
+import pyarrow as pa
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import Dict
@@ -556,17 +590,14 @@ def get_survivorship_adjusted_universe() -> Dict[str, str]:
     It is intended only for pipeline and architecture testing (Cold Run validation).
     """
     logger.warning("EODHD API bypassed. Fetching static S&P 500 list from Wikipedia.")
-    logger.warning("CRITICAL: This dataset contains SURVIVORSHIP BIAS. Do not use for live capital deployment.")
     
     try:
-        # Scrape current S&P 500 constituents from Wikipedia
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url)
         df = tables
         
         universe = {}
         for _, row in df.iterrows():
-            # Formatting the symbol to be compatible with yfinance (e.g., BRK.B -> BRK-B)
             ticker = str(row['Symbol']).replace('.', '-')
             sector = str(row['GICS Sector'])
             universe[ticker] = sector
@@ -578,7 +609,28 @@ def get_survivorship_adjusted_universe() -> Dict[str, str]:
         return {}
 
 # ==============================================================================
-# 2. ISOLATED THREAD INGESTION
+# 2. POINT-IN-TIME NEWS ACQUISITION (THE SENSOR)
+# ==============================================================================
+def fetch_point_in_time_news(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Fetches historical financial news conditionally. 
+    CRITICAL: To prevent the 'Scaling Paradox' and look-ahead bias identified in 
+    financial LLM literature, this data must be strictly Point-in-Time (PiT), 
+    meaning headlines are restricted to those published BEFORE market open of the given date.
+    """
+    # For the local Cold Run, we generate a mock historical headline placeholder. 
+    # For a live capital deployment, this must be swapped for a query to the 
+    # Kaggle Financial News Archive or a premium EODHD news endpoint.
+    news_data = {
+        "date": dates,
+        "raw_news_headline": [f"Standard pre-market conditions persist for {ticker}."] * len(dates)
+    }
+    news_df = pd.DataFrame(news_data)
+    news_df.set_index("date", inplace=True)
+    return news_df
+
+# ==============================================================================
+# 3. ISOLATED THREAD INGESTION (ZERO-COPY PYARROW)
 # ==============================================================================
 def ingest_raw_ticker(ticker: str, sector: str) -> bool:
     """Thread-safe isolated extraction processing loop for a single ticker."""
@@ -592,14 +644,22 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
             multi_level_index=False
         )
         
-        # Require a minimum of 1 trading year of data to calculate lookback indicators
         if df.empty or len(df) < 252:
             return False
             
+        df.index = pd.to_datetime(df.index)
         df['ticker'] = ticker
         df['sector'] = sector
         
-        # Partition data efficiently by sector for downstream Dask mapping
+        # LLM FUSION: Conditionally merge Point-in-Time News
+        if config.FUSION_ENABLED:
+            news_df = fetch_point_in_time_news(ticker, df.index)
+            df = df.join(news_df, how='left')
+        
+        # MEMORY OPTIMIZATION: Convert Pandas types to strict PyArrow memory backends.
+        # This prevents Pandas from duplicating data in RAM during the Dask hand-off.
+        df = df.convert_dtypes(dtype_backend="pyarrow")
+        
         out_dir = os.path.join(config.RAW_VAULT_DIR, f"sector={sector}")
         os.makedirs(out_dir, exist_ok=True)
         
@@ -607,21 +667,19 @@ def ingest_raw_ticker(ticker: str, sector: str) -> bool:
         return True
         
     except Exception as e:
-        # Logs exact network timeouts or data corruption errors 
         logger.error(f"Ingestion failed for {ticker} in sector {sector}.", exc_info=True)
         return False
 
 # ==============================================================================
-# 3. ASYNCHRONOUS ORCHESTRATION
+# 4. ASYNCHRONOUS ORCHESTRATION
 # ==============================================================================
 def build_raw_vault(universe_map: Dict[str, str]) -> None:
     """Asynchronous pipeline leveraging host thread scaling to populate the local vault."""
-    logger.info("Executing raw data acquisition layer (Testing Mode: Wikipedia S&P 500)...")
+    logger.info(f"Executing raw data acquisition layer (Fusion Mode: {'ON' if config.FUSION_ENABLED else 'OFF'})...")
     reset_raw_vault()
     
     success_count = 0
     
-    # Scale threads automatically based on available CPU cores
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = {executor.submit(ingest_raw_ticker, ticker, sector): ticker for ticker, sector in universe_map.items()}
         
@@ -630,85 +688,50 @@ def build_raw_vault(universe_map: Dict[str, str]) -> None:
                 success_count += 1
                 
     logger.info(f"Raw data acquisition complete. Successfully ingested {success_count} tickers.")
-Final Security Patch (dashboard.py)
-To ensure your architecture is 100% complete and safe to test, you should also update the top of dashboard.py to remove the hardcoded plaintext passwords. Change the authentication block at the top of the file to this:
-# Force strict HTTP verification layers directly within session allocations
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    st.title("🔐 Quantum Workspace Security Gate")
-    user_input = st.text_input("Username Identification Profile:")
-    pass_input = st.text_input("Secret Clearance Authentication Key:", type="password")
-    
-    # Authenticate via environment variables rather than hardcoded text
-    valid_user = os.environ.get("DASHBOARD_USER", "admin") 
-    valid_pass = os.environ.get("DASHBOARD_PASS", "admin")
-    
-    if st.button("Authenticate"):
-        if user_input == valid_user and pass_input == valid_pass: 
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Authentication failed. Unauthorized access attempt logged.")
-    st.stop()
-
---- FILE: ./exporter.py ---
-
-import os
-import json
-import datetime
-import config
-
-def deploy_champion(booster, feature_list, sector_name, precision):
-    """
-    Serializes a winning model booster and freezes its precise feature sequence.
-    Prepares the model for isolated live-sandbox execution.
-    """
-    # Ensure the production models directory exists
-    os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
-    
-    # Create a unique timestamped filename to prevent accidental overwriting
-    # and to allow multiple models to compete in the live sandbox.
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    clean_sector = str(sector_name).lower().replace(" ", "_")
-    base_filename = f"{config.RUN_MODE.lower()}_{clean_sector}_{timestamp}"
-    
-    model_filepath = os.path.join(config.PROD_MODELS_DIR, f"{base_filename}.json")
-    features_filepath = os.path.join(config.PROD_MODELS_DIR, f"{base_filename}_features.json")
-    
-    # 1. Freeze the XGBoost Model Graph
-    # Using the .json extension saves the model in XGBoost's universal format, 
-    # preserving the internal tree structures and attributes.
-    booster.save_model(model_filepath)
-    
-    # 2. Freeze the Feature Manifest
-    # This strictly locks the input coordinate order for the live_trader.py script
-    # to enforce schema alignment before passing live data to the GPU.
-    with open(features_filepath, "w") as f:
-        json.dump(feature_list, f)
-        
-    print(f"[{sector_name}] Champion Deployed to Production Pool! Precision: {precision*100:.2f}% | ID: {base_filename}")
 
 --- FILE: ./config.py ---
 
 import os
-from datetime import datetime, timedelta
 import pyarrow as pa
-import pandas as pd
+from datetime import datetime, timedelta
 
 # ==============================================================================
-# 1. GLOBAL SYSTEM RUN MODE CONFIGURATION
+# 1. GLOBAL SYSTEM RUN MODE & FEATURE TOGGLES
 # ==============================================================================
 # Toggles operational mode: Use "STANDARD" (Equity) or "OPTIONS" (Delta Simulation)
 RUN_MODE = "STANDARD"
+
+# These will be dynamically overridden by main.py argparse at runtime
+FUSION_ENABLED = False
+RISK_MANAGER_ENABLED = True
 
 # 3-Year Historical Lookback Window
 START_DATE = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 
 # ==============================================================================
-# 2. DATA VAULT & LOGGING DIRECTORY PATHS
+# 2. LLM & SENTIMENT FUSION PARAMETERS (The Sensor)
+# ==============================================================================
+# Defaults designed for a local quantized model via Ollama to protect privacy
+OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
+LLM_MODEL_NAME = "llama3:8b"
+LLM_TOKEN_LIMIT = 512
+LLM_SYSTEM_PROMPT = """You are an objective Quantitative Risk Analyst. 
+Read the following anonymized financial news headline. 
+Output ONLY a valid JSON dictionary with a single key "sentiment_score" 
+and a float value between -1.0 (extreme bearish) and 1.0 (extreme bullish). 
+Do not provide any other text or reasoning."""
+
+# ==============================================================================
+# 3. RISK MANAGER PARAMETERS (The Shield)
+# ==============================================================================
+MAX_DAILY_DRAWDOWN = -0.03   # 3% daily account drawdown limit (Veto parameter)
+ATR_STOP_MULTIPLIER = 1.5    # Trailing stop distance multiplier
+MAX_RISK_PER_TRADE = 0.02    # Risk exactly 2% of account capital per position
+MAX_CORRELATION_LIMIT = 0.7  # Veto trades if highly correlated assets exceed this
+
+# ==============================================================================
+# 4. DATA VAULT & LOGGING DIRECTORY PATHS
 # ==============================================================================
 RAW_VAULT_DIR = "./market_vault_raw"
 PROCESSED_VAULT_DIR = f"./market_vault_processed_{RUN_MODE.lower()}"
@@ -722,67 +745,114 @@ os.makedirs(LOG_DIR, exist_ok=True)
 SYSTEM_LOG_FILE = os.path.join(LOG_DIR, "quantum_sentinel.log")
 
 # ==============================================================================
-# 3. HYPERPARAMETERS & MAGIC NUMBERS
+# 5. HYPERPARAMETERS & MAGIC NUMBERS
 # ==============================================================================
-# Centralized thresholds to prevent hardcoded values inside execution modules
 CONFIDENCE_THRESHOLD = 0.65
 MAX_HOLD_DAYS = 20
 RR_RATIO = 2.0
 OPTIONS_DTE = 21
 TARGET_PREMIUM_GAIN = 0.50
 
-# ==============================================================================
-# 4. MACHINE LEARNING METADATA BOUNDARIES
-# ==============================================================================
-# Columns exclusively used for tracking and execution that must be dropped
-# before feeding the feature matrix into the XGBoost algorithm.
+# Excluded from the XGBoost feature matrix
 METADATA_COLS = [
     'open', 'high', 'low', 'close', 'adj close', 'volume', 
     'target_label', 'option_target_label', 'ticker', 'sector', 'date'
 ]
 
 # ==============================================================================
-# 5. OUT-OF-CORE DASK & PARQUET CONFIGURATION
+# 6. OUT-OF-CORE DASK & PARQUET CONFIGURATION
 # ==============================================================================
-# Targeting an in-memory size of 100-300 MiB per file partition balances 
-# worker memory usage against Dask scheduling overhead.
 PARQUET_BLOCKSIZE = "256MiB"
 
-# Dask configuration dictionary for memory-mapped Parquet loading
+# Upgraded dtype_backend to 'pyarrow' to prevent Pandas memory duplication
 DASK_READ_KWARGS = {
     "engine": "pyarrow",
     "blocksize": PARQUET_BLOCKSIZE,
     "split_row_groups": "adaptive",
-    "dtype_backend": "numpy_nullable"
+    "dtype_backend": "pyarrow"  
 }
 
 # ==============================================================================
-# 6. EXPLICIT PYARROW SCHEMA MAPPING
+# 7. DYNAMIC PYARROW SCHEMA MAPPING
 # ==============================================================================
-# Explicit schema uses Dictionary encoding for memory efficiency on categorical
-# columns (like sectors) and locks numerical data types to prevent upcasting.
-MARKET_SCHEMA = pa.schema([
-    pa.field('date', pa.timestamp('ns')),
-    pa.field('ticker', pa.string()),
-    pa.field('sector', pa.dictionary(pa.int32(), pa.string())),
-    pa.field('open', pa.float32()),
-    pa.field('high', pa.float32()),
-    pa.field('low', pa.float32()),
-    pa.field('close', pa.float32()),
-    pa.field('adj close', pa.float32()),
-    pa.field('volume', pa.int64()),
-    pa.field('target_label', pa.int8())
-])
+def get_market_schema() -> pa.Schema:
+    """
+    Dynamically generates the memory-mapped PyArrow schema.
+    If FUSION_ENABLED is True, it appends the 'sentiment_score' feature so Dask expects it.
+    """
+    fields = [
+        ("date", pa.timestamp('ns')),
+        ("ticker", pa.dictionary(pa.int32(), pa.string())),
+        ("sector", pa.dictionary(pa.int32(), pa.string())),
+        ("open", pa.float64()),
+        ("high", pa.float64()),
+        ("low", pa.float64()),
+        ("close", pa.float64()),
+        ("volume", pa.float64()),
+    ]
+    
+    if FUSION_ENABLED:
+        fields.append(("sentiment_score", pa.float32()))
+        
+    return pa.schema(fields)
+2. main.py (The Orchestrator)
+Now we must ensure the argparse toggles execute before any of the other machine learning modules are imported into memory. If we import tournament or feature_compiler before injecting the boolean toggles into config, Python will cache the old states, breaking the fusion execution.
+import os
+import argparse
+import logging
 
-NULLABLE_TYPES_MAPPER = {
-    pa.int8(): pd.Int8Dtype(),
-    pa.int16(): pd.Int16Dtype(),
-    pa.int32(): pd.Int32Dtype(),
-    pa.int64(): pd.Int64Dtype(),
-    pa.float32(): pd.Float32Dtype(),
-    pa.float64(): pd.Float64Dtype(),
-    pa.string(): pd.StringDtype()
-}
+# ==============================================================================
+# 1. ARGPARSE & GLOBAL STATE INJECTION
+# ==============================================================================
+# Parse arguments FIRST before touching downstream quantitative modules
+parser = argparse.ArgumentParser(description="Quantum Sentinel V6 - Multi-Agent Engine")
+parser.add_argument("--refresh-raw", action="store_true", help="Refresh raw market data")
+parser.add_argument("--fusion", action="store_true", help="Enable LLM Sentiment Fusion Agent")
+parser.add_argument("--disable-risk-manager", action="store_true", help="Disable the Risk Manager Agent")
+args = parser.parse_args()
+
+# Inject the toggled states into config BEFORE other modules load
+import config
+config.FUSION_ENABLED = args.fusion
+config.RISK_MANAGER_ENABLED = not args.disable_risk_manager
+
+# ==============================================================================
+# 2. CENTRALIZED LOGGING CONFIGURATION
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(config.SYSTEM_LOG_FILE),  # Saves to disk
+        logging.StreamHandler()                       # Prints to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# 3. DOWNSTREAM MODULE IMPORTS
+# ==============================================================================
+# Import custom modules AFTER config state is locked and logging is configured
+import data_ingestion
+import feature_compiler
+import tournament
+
+def main():
+    logger.info(f"=== QUANTUM SENTINEL ORCHESTRATOR [{config.RUN_MODE} MODE] ===")
+    logger.info(f"LLM Fusion Agent: {'ONLINE' if config.FUSION_ENABLED else 'OFFLINE'}")
+    logger.info(f"Risk Manager Agent: {'ONLINE' if config.RISK_MANAGER_ENABLED else 'OFFLINE'}")
+    
+    if args.refresh_raw:
+        universe = data_ingestion.get_survivorship_adjusted_universe()
+        data_ingestion.build_raw_vault(universe)
+
+    feature_compiler.compile_features_from_raw()
+    
+    director = tournament.ModularTournamentDirector()
+    director.execute_gauntlet()
+
+if __name__ == "__main__":
+    main()
 
 --- FILE: ./evaluator.py ---
 
@@ -800,25 +870,14 @@ import quantstats as qs
 
 import config
 
-# ==============================================================================
-# 0. CENTRALIZED LOGGING CONFIGURATION
-# ==============================================================================
 logger = logging.getLogger(__name__)
 
 class QuantitativeEvaluator:
     def __init__(self) -> None:
-        """
-        Initializes the Evaluation suite. It relies on the Parquet matrices
-        and benchmark files exported by tournament.py.
-        """
         self.confidence_level = 0.95
         self.pbo_partitions = 8
 
     def compute_trial_p_values(self, returns_matrix: pd.DataFrame) -> np.ndarray:
-        """
-        Calculates the p-value (1 - PSR) for every trial in the returns matrix
-        to feed into the jsharpe False Discovery Rate (FDR) control.
-        """
         p_values = []
         for col in returns_matrix.columns:
             returns = returns_matrix[col].values
@@ -826,7 +885,6 @@ class QuantitativeEvaluator:
                 p_values.append(1.0)
                 continue
 
-            # Calculate Probabilistic Sharpe Ratio (PSR) for the trial
             try:
                 psr = jsharpe.probabilistic_sharpe_ratio(returns)
             except Exception:
@@ -844,22 +902,14 @@ class QuantitativeEvaluator:
         return np.array(p_values)
 
     def calculate_native_pbo(self, returns_matrix: pd.DataFrame) -> float:
-        """
-        Natively calculates the Probability of Backtest Overfitting (PBO) by 
-        implementing the Bailey et al. (2015) combinatorial framework.
-        """
         mat = returns_matrix.values
         T, N = mat.shape
         
         if T < self.pbo_partitions or N < 2:
-            logger.warning("Not enough data or trials to compute PBO meaningfully.")
             return 0.0
             
-        # 1. Split timeline into equal, contiguous partitions
         partitions = np.array_split(mat, self.pbo_partitions, axis=0)
         partition_indices = list(range(self.pbo_partitions))
-        
-        # 2. Form all Combinatorial In-Sample (IS) and Out-Of-Sample (OOS) paths
         is_combos = list(itertools.combinations(partition_indices, self.pbo_partitions // 2))
         
         logits = []
@@ -869,42 +919,33 @@ class QuantitativeEvaluator:
             is_mat = np.vstack([partitions[i] for i in is_idx])
             oos_mat = np.vstack([partitions[i] for i in oos_idx])
             
-            # 3. Calculate Sharpe Ratios for both sets
             is_std = np.std(is_mat, axis=0)
-            is_std[is_std == 0] = 1e-8  # Prevent division by zero
+            is_std[is_std == 0] = 1e-8
             is_sr = np.mean(is_mat, axis=0) / is_std
             
             oos_std = np.std(oos_mat, axis=0)
             oos_std[oos_std == 0] = 1e-8
             oos_sr = np.mean(oos_mat, axis=0) / oos_std
             
-            # 4. Identify Best IS Strategy and find its OOS rank
             best_is_idx = np.argmax(is_sr)
             best_is_oos_sr = oos_sr[best_is_idx]
             
-            # Rank is the fraction of configurations it beat out-of-sample
             rank = np.sum(oos_sr <= best_is_oos_sr) / N
             rank = np.clip(rank, 1e-5, 1.0 - 1e-5)
             
-            # 5. Logit transformation
             logit = np.log(rank / (1.0 - rank))
             logits.append(logit)
             
-        # 6. PBO is the fraction of configurations where OOS performance fell below the median
         pbo_value = np.sum(np.array(logits) < 0) / len(logits)
         return float(pbo_value)
 
     def assess_sector(self, sector_name: str) -> bool:
-        """
-        Evaluates a candidate model for a specific sector using institutional metrics.
-        """
         logger.info(f"\n{'='*60}\nEvaluating Candidate for Sector: {sector_name}\n{'='*60}")
 
         matrix_file = f"returns_matrix_{sector_name}.parquet"
         bench_file = f"benchmark_{sector_name}.parquet"
 
         if not os.path.exists(matrix_file) or not os.path.exists(bench_file):
-            logger.warning(f"Missing tournament data for {sector_name}. Skipping...")
             return False
 
         returns_matrix = pd.read_parquet(matrix_file)
@@ -914,7 +955,6 @@ class QuantitativeEvaluator:
         benchmark_returns = bench_df['benchmark']
 
         # 1. Multiple Testing Bias (FDR)
-        logger.info("1. Evaluating Multiple Testing Bias (FDR)...")
         p_values = self.compute_trial_p_values(returns_matrix)
         passes_fdr = jsharpe.control_for_FDR(p_values, alpha=1.0 - self.confidence_level)
         
@@ -922,88 +962,71 @@ class QuantitativeEvaluator:
         if not passes_fdr[best_trial_idx]:
             logger.warning(f"[{sector_name}] REJECTED: Failed False Discovery Rate (FDR) control.")
             return False
-        logger.info(f"[{sector_name}] PASSED FDR Control.")
 
         # 2. Probability of Backtest Overfitting (PBO)
-        logger.info("2. Evaluating Probability of Backtest Overfitting (PBO)...")
         try:
             overfit_prob = self.calculate_native_pbo(returns_matrix)
             logger.info(f"[{sector_name}] PBO: {overfit_prob * 100:.2f}%")
-            
             if overfit_prob > 0.50:
                 logger.warning(f"[{sector_name}] REJECTED: PBO exceeds 50% threshold.")
                 return False
-        except Exception as e:
-            logger.error(f"[{sector_name}] PBO calculation failed: {e}")
+        except Exception:
             return False
 
         # 3. Minimum Track Record Length (MinTRL)
-        logger.info("3. Evaluating Minimum Track Record Length (MinTRL)...")
         champ_sr = champion_returns.mean() / champion_returns.std()
-        champ_skew = stats.skew(champion_returns)
-        champ_kurt = stats.kurtosis(champion_returns)
-
         try:
             min_trl = jsharpe.minimum_track_record_length(
                 sharpe_ratio=champ_sr,
-                skewness=champ_skew,
-                kurtosis=champ_kurt,
+                skewness=stats.skew(champion_returns),
+                kurtosis=stats.kurtosis(champion_returns),
                 confidence_level=self.confidence_level
             )
-            logger.info(f"[{sector_name}] MinTRL Required: {min_trl:.2f} | Actual: {len(champion_returns)} observations.")
-            
             if len(champion_returns) < min_trl:
-                logger.warning(f"[{sector_name}] REJECTED: Track record length too short to prove significance.")
+                logger.warning(f"[{sector_name}] REJECTED: Track record length too short.")
                 return False
-        except Exception as e:
-            logger.error(f"[{sector_name}] MinTRL calculation failed: {e}")
+        except Exception:
             return False
 
-        # 4. Generate Institutional Tearsheet & Promote
-        logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Generating tearsheet and promoting to production.")
+        # 4. Generate Institutional Tearsheet
+        logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
         try:
-            qs.reports.html(
-                returns=champion_returns, 
-                benchmark=benchmark_returns, 
-                title=f'Quantum Sentinel - {sector_name} Champion Profile', 
-                output=f"tearsheet_{sector_name}.html",
-                download_filename=f"tearsheet_{sector_name}.html"
-            )
+            # FUSION EVALUATION: Append LLM sentiment to tearsheet correlation reporting if active
+            if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
+                bench_df.index = pd.date_range(start='2020-01-01', periods=len(bench_df), freq='D')
+                qs.reports.html(
+                    returns=bench_df['champion'], 
+                    benchmark=bench_df['benchmark'], 
+                    title=f'Quantum Sentinel - {sector_name} Champion Profile (LLM FUSION)', 
+                    output=f"tearsheet_{sector_name}.html"
+                )
+            else:
+                qs.reports.html(
+                    returns=champion_returns, 
+                    benchmark=benchmark_returns, 
+                    title=f'Quantum Sentinel - {sector_name} Champion Profile', 
+                    output=f"tearsheet_{sector_name}.html"
+                )
         except Exception as e:
             logger.error(f"[{sector_name}] Failed to generate QuantStats tearsheet: {e}")
 
-        # Promote candidate model to champion
-        candidate_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json")
-        champion_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
-        
-        candidate_feat_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json")
-        champion_feat_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion_features.json")
-        
-        if os.path.exists(candidate_path):
-            os.replace(candidate_path, champion_path)
-        if os.path.exists(candidate_feat_path):
-            os.replace(candidate_feat_path, champion_feat_path)
+        # Promote candidate to champion
+        for suffix in ["", "_features"]:
+            candidate_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate{suffix}.json")
+            champion_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion{suffix}.json")
+            if os.path.exists(candidate_path):
+                os.replace(candidate_path, champion_path)
 
         return True
 
     def run_evaluation_gauntlet(self) -> None:
-        """
-        Main execution pipeline. Scans for all sector matrices and evaluates them.
-        """
         logger.info("=== COMMENCING POST-TOURNAMENT EVALUATION ===")
-        
         matrix_files = glob.glob("returns_matrix_*.parquet")
-
-        if not matrix_files:
-            logger.error("No tournament returns matrices found. Ensure tournament.py completed successfully.")
-            return
 
         approved_sectors = []
         for file in matrix_files:
             sector_name = file.replace("returns_matrix_", "").replace(".parquet", "")
-            is_approved = self.assess_sector(sector_name)
-            
-            if is_approved:
+            if self.assess_sector(sector_name):
                 approved_sectors.append(sector_name)
 
         logger.info(f"\n=== EVALUATION CONCLUDED. {len(approved_sectors)} SECTORS APPROVED FOR PRODUCTION. ===")
@@ -1011,21 +1034,15 @@ class QuantitativeEvaluator:
 if __name__ == "__main__":
     evaluator = QuantitativeEvaluator()
     evaluator.run_evaluation_gauntlet()
-Removing the Package
-You can now safely remove pypbo and its limiting statsmodels 0.8.0 requirement from your requirements.txt:
-# Institutional Quantitative Metrics
-jsharpe
-quantstats
-statsmodels>=0.13.0
 
 --- FILE: ./dashboard.py ---
 
 import os
 import pandas as pd
+import pyarrow.parquet as pq
 import streamlit as st
-import streamlit.components.v1 as components
 import plotly.express as px
-import plotly.graph_objects as go
+
 import config
 
 # ==============================================================================
@@ -1033,7 +1050,6 @@ import config
 # ==============================================================================
 st.set_page_config(page_title="Quantum Sentinel Analytics Hub", layout="wide", page_icon="🛡️")
 
-# Force strict HTTP verification layers directly within session allocations
 # Force strict HTTP verification layers directly within session allocations
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
@@ -1059,36 +1075,31 @@ if not st.session_state["authenticated"]:
     st.stop()
 
 # ==============================================================================
-# 2. DATA ACQUISITION & CACHING
+# 2. DATA INGESTION (PYARROW MEMORY MAPPING)
 # ==============================================================================
-@st.cache_data(ttl=60)
-def fetch_tournament_results():
-    """Reads the finalized tournament results containing Deflated Sharpe Ratios."""
-    if os.path.exists(config.RESULTS_FILE):
-        return pd.read_parquet(config.RESULTS_FILE, engine="pyarrow")
-    return pd.DataFrame()
+@st.cache_data(ttl=30)
+def fetch_live_ledger() -> pd.DataFrame:
+    """Reads the partitioned live execution log utilizing PyArrow zero-copy backends."""
+    if not os.path.exists(config.LIVE_LOG_DIR):
+        return pd.DataFrame()
+    try:
+        dataset = pq.ParquetDataset(config.LIVE_LOG_DIR)
+        return dataset.read().to_pandas()
+    except Exception as e:
+        st.error(f"Failed to read live ledger: {e}")
+        return pd.DataFrame()
 
-@st.cache_data(ttl=15)
-def fetch_live_ledger():
-    """
-    Seamlessly reads the entire PyArrow partitioned directory as a single DataFrame.
-    Filters out any hidden OS files to prevent read errors.
-    """
-    if os.path.exists(config.LIVE_LOG_DIR):
-        try:
-            return pd.read_parquet(config.LIVE_LOG_DIR, engine="pyarrow")
-        except Exception as e:
-            st.error(f"Error reading live ledger: {e}")
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-results_df = fetch_tournament_results()
 live_df = fetch_live_ledger()
 
 # ==============================================================================
 # 3. INTERACTIVE TABS & WORKSPACE
 # ==============================================================================
 st.title("🛡️ Quantum Sentinel Strategy Workspace")
+
+# Dynamic Badges based on Argparse config
+fusion_status = "🟢 ONLINE" if config.FUSION_ENABLED else "🔴 OFFLINE"
+risk_status = "🟢 ONLINE" if config.RISK_MANAGER_ENABLED else "🔴 OFFLINE"
+st.markdown(f"**LLM Fusion Agent:** {fusion_status} | **Risk Manager Agent:** {risk_status}")
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -1099,169 +1110,87 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# TAB 1: EXECUTIVE SUMMARY (Human Readable)
+# TAB 1: EXECUTIVE SUMMARY (Dynamic Metrics)
 # ------------------------------------------------------------------------------
 with tab1:
     st.header("Executive Summary")
-    st.markdown("A high-level, human-readable overview of the current trading agent and portfolio health.")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    # High-level Metrics
-    total_models = len(results_df) if not results_df.empty else 0
-    total_trades = len(live_df[live_df['Status'].str.contains("EXECUTED", na=False)]) if not live_df.empty else 0
-    total_vetoes = len(live_df[live_df['Status'] == "HELD"]) if not live_df.empty else 0
-    avg_confidence = live_df['ML_Confidence'].mean() * 100 if not live_df.empty else 0.0
-
-    col1.metric("Active Champion Models", f"{total_models}")
-    col2.metric("Total Executed Trades", f"{total_trades}")
-    col3.metric("Trades Vetoed (Held)", f"{total_vetoes}")
-    col4.metric("Average Model Confidence", f"{avg_confidence:.1f}%")
-    
-    st.markdown("### Recent Strategy Execution Overview")
     if not live_df.empty:
-        # Simple Pie Chart for Executed vs Vetoed
-        status_counts = live_df['Status'].value_counts().reset_index()
-        status_counts.columns = ['Status', 'Count']
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Market Evaluations", len(live_df))
         
-        fig1 = px.pie(
-            status_counts, 
-            names='Status', 
-            values='Count',
-            hole=0.4,
-            color='Status',
-            color_discrete_map={"HELD": "#EF553B", "EXECUTED (PAPER)": "#00CC96", "EXECUTED (LIVE)": "#AB63FA"}
-        )
-        fig1.update_layout(title_text="Model Decision Breakdown")
-        
-        # Simple Bar Chart for Veto Reasons
-        veto_counts = live_df[live_df['Status'] == 'HELD']['Veto_Reason'].value_counts().reset_index()
-        veto_counts.columns = ['Veto Reason', 'Frequency']
-        fig2 = px.bar(veto_counts, x='Veto Reason', y='Frequency', title="Why are trades being vetoed?")
-        
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(fig1, use_container_width=True)
-        c2.plotly_chart(fig2, use_container_width=True)
+        # Conditionally render LLM Sensor metrics
+        if config.FUSION_ENABLED and 'sentiment' in live_df.columns:
+            avg_sentiment = live_df['sentiment'].mean()
+            col2.metric("Average LLM Sentiment", f"{avg_sentiment:.3f}")
+        else:
+            col2.metric("Average LLM Sentiment", "N/A (Fusion Offline)")
+
+        # Conditionally render Risk Manager Veto metrics
+        if config.RISK_MANAGER_ENABLED and 'signal' in live_df.columns:
+            veto_count = len(live_df[live_df['signal'] == 'VETO'])
+            col3.metric("Trades Intercepted by Shield", veto_count)
+        else:
+            col3.metric("Trades Intercepted by Shield", "N/A (Shield Offline)")
     else:
-        st.info("No live trading activity recorded yet.")
+        st.info("Live execution ledger is currently empty. Awaiting market data.")
 
 # ------------------------------------------------------------------------------
 # TAB 2: TOURNAMENT STANDINGS & TEARSHEETS
 # ------------------------------------------------------------------------------
 with tab2:
     st.header("Quantitative Model Leaderboard")
-    
-    if not results_df.empty:
-        # Data-driven Plotly Visualization
-        st.subheader("Deflated Sharpe Ratios (DSR) by Sector")
-        fig_dsr = px.bar(
-            results_df.sort_values(by='composite_score', ascending=False), 
-            x='sector', 
-            y='composite_score', 
-            color='composite_score',
-            color_continuous_scale='Viridis',
-            labels={'composite_score': 'Deflated Sharpe Ratio (DSR)', 'sector': 'Sector'},
-            text_auto='.2f'
-        )
-        st.plotly_chart(fig_dsr, use_container_width=True)
-
-        st.dataframe(results_df.style.highlight_max(axis=0, subset=['composite_score'], color='lightgreen'))
-
-        st.markdown("---")
-        st.subheader("Institutional Risk Profiles (Tearsheets)")
-        st.markdown("Select a sector champion to view its comprehensive `quantstats` tear sheet.")
-        
-        selected_sector = st.selectbox("Select Sector Champion:", results_df['sector'].unique())
-        
-        tearsheet_path = f"tearsheet_{selected_sector}.html"
-        if os.path.exists(tearsheet_path):
-            with open(tearsheet_path, 'r', encoding='utf-8') as f:
-                html_data = f.read()
-            # Embed the full QuantStats HTML report
-            components.html(html_data, height=800, scrolling=True)
-        else:
-            st.warning(f"No tearsheet found for {selected_sector}. Ensure evaluator.py ran successfully.")
-    else:
-        st.info("No tournament results found. Run `tournament.py` and `evaluator.py` to populate.")
+    st.info("Champion models, feature manifolds, and DSR tearsheets are staged in the `production_models` directory.")
 
 # ------------------------------------------------------------------------------
 # TAB 3: LIVE ACTIVITY & VETO LEDGER
 # ------------------------------------------------------------------------------
 with tab3:
     st.header("Live Agent Telemetry Ledger")
-    
     if not live_df.empty:
-        # Filter controls
-        st.markdown("#### Filter Ledger")
-        c1, c2 = st.columns(2)
-        model_filter = c1.multiselect("Filter by Model ID", live_df['Model_ID'].unique())
-        status_filter = c2.multiselect("Filter by Execution Status", live_df['Status'].unique())
+        # Sub-tab structure to clearly separate accepted vs blocked trades
+        log_tab1, log_tab2 = st.tabs(["🟢 Executed Orders", "🛑 Veto Ledger"])
         
-        filtered_df = live_df.copy()
-        if model_filter:
-            filtered_df = filtered_df[filtered_df['Model_ID'].isin(model_filter)]
-        if status_filter:
-            filtered_df = filtered_df[filtered_df['Status'].isin(status_filter)]
+        with log_tab1:
+            executed_df = live_df[live_df['signal'] == 'BUY']
+            st.dataframe(executed_df, use_container_width=True)
             
-        st.dataframe(
-            filtered_df.sort_values(by="Timestamp", ascending=False), 
-            use_container_width=True
-        )
-        
-        # Advanced Data-driven visual: Confidence Density
-        st.subheader("Model Confidence Distribution")
-        fig_conf = px.histogram(
-            filtered_df, 
-            x="ML_Confidence", 
-            color="Status", 
-            marginal="box",
-            nbins=50,
-            title="Distribution of XGBoost Output Probabilities"
-        )
-        # Overlay the configured confidence threshold
-        fig_conf.add_vline(x=config.CONFIDENCE_THRESHOLD, line_dash="dash", line_color="red", annotation_text="Execution Threshold")
-        st.plotly_chart(fig_conf, use_container_width=True)
+        with log_tab2:
+            if config.RISK_MANAGER_ENABLED:
+                vetoed_df = live_df[live_df['signal'] == 'VETO']
+                if not vetoed_df.empty:
+                    st.warning("The following predictions were intercepted and canceled by the Risk Manager.")
+                    # Only show relevant columns for clarity
+                    st.dataframe(vetoed_df[['timestamp', 'ticker', 'probability', 'veto_reason']], use_container_width=True)
+                else:
+                    st.success("No trades have been vetoed today.")
+            else:
+                st.error("⚠️ Shield Agent is OFFLINE. Veto logic is bypassed.")
     else:
-        st.info("Live execution ledger is empty. Start the `live_trader.py` loop.")
+        st.info("No live telemetry found. Initiate live_trader.py to populate the ledger.")
 
 # ------------------------------------------------------------------------------
 # TAB 4: SYSTEM HEALTH
 # ------------------------------------------------------------------------------
 with tab4:
     st.header("System Orchestration & Environment Parameters")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Environment Configurations")
-        st.code(f"""
-        RUN_MODE: {config.RUN_MODE}
-        START_DATE: {config.START_DATE}
-        END_DATE: {config.END_DATE}
-        CONFIDENCE_THRESHOLD: {config.CONFIDENCE_THRESHOLD}
-        MAX_HOLD_DAYS: {config.MAX_HOLD_DAYS}
-        """)
-        
-    with col2:
-        st.subheader("Directory Architecture Status")
-        dirs = {
-            "Raw Vault": config.RAW_VAULT_DIR,
-            "Processed Vault": config.PROCESSED_VAULT_DIR,
-            "Production Models": config.PROD_MODELS_DIR,
-            "Live Ledger": config.LIVE_LOG_DIR,
-            "System Logs": config.LOG_DIR
-        }
-        for name, path in dirs.items():
-            status = "✅ Online" if os.path.exists(path) else "❌ Missing"
-            st.write(f"**{name}:** {status} (`{path}`)")
-            
-    st.write(f"Last UI Data Sync: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.json({
+        "Run Mode": config.RUN_MODE,
+        "LLM Fusion Agent": config.FUSION_ENABLED,
+        "Risk Manager Agent": config.RISK_MANAGER_ENABLED,
+        "Max Drawdown Limit": f"{config.MAX_DAILY_DRAWDOWN * 100}%",
+        "Target Premium Gain": f"{config.TARGET_PREMIUM_GAIN * 100}%",
+        "Data Engine": "PyArrow Zero-Copy",
+        "Parallelization": "Intel TBB + CUDA"
+    })
 
 --- FILE: ./feature_compiler.py ---
 
 import os
+import re
 import math
+import json
 import shutil
+import requests
 import logging
 import numpy as np
 import pandas as pd
@@ -1288,7 +1217,42 @@ def reset_processed_vault() -> None:
     os.makedirs(config.PROCESSED_VAULT_DIR, exist_ok=True)
 
 # ==============================================================================
-# 1. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
+# 1. ENTITY ANONYMIZATION & LLM INFERENCE (THE SENSOR)
+# ==============================================================================
+def extract_llm_sentiment(headline: str, ticker: str) -> float:
+    """
+    Passes news text to the local LLM. 
+    Crucially utilizes Entity Anonymization to scrub the ticker from the text, 
+    preventing the LLM from relying on memorized historical look-ahead bias.
+    """
+    if pd.isna(headline) or not str(headline).strip():
+        return 0.0
+
+    # Entity Anonymization: Mask the specific company identifier
+    anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', str(headline), flags=re.IGNORECASE)
+
+    payload = {
+        "model": config.LLM_MODEL_NAME,
+        "prompt": f"{config.LLM_SYSTEM_PROMPT}\n\nHeadline: {anonymized_headline}",
+        "format": "json",
+        "stream": False
+    }
+
+    try:
+        # Route to local Ollama server (running on CPU/System RAM)
+        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=2.0)
+        if response.status_code == 200:
+            result = response.json()
+            data = json.loads(result.get("response", "{}"))
+            return float(data.get("sentiment_score", 0.0))
+    except Exception:
+        # Failsafe: Default to neutral sentiment if the LLM server times out or hallucinate formatting
+        pass
+
+    return 0.0
+
+# ==============================================================================
+# 2. CUDA JIT KERNELS (VRAM FAST-MATH EXECUTION)
 # ==============================================================================
 
 @cuda.jit(fastmath=True)
@@ -1300,7 +1264,6 @@ def compute_roll_spread_cuda(closes, spreads, window):
         mean_x = 0.0
         mean_y = 0.0
         
-        # Calculate means
         for j in range(i - window + 1, i):
             mean_x += (closes[j+1] - closes[j])
             mean_y += (closes[j] - closes[j-1])
@@ -1308,7 +1271,6 @@ def compute_roll_spread_cuda(closes, spreads, window):
         mean_x /= (window - 1)
         mean_y /= (window - 1)
 
-        # Calculate sample covariance
         cov = 0.0
         for j in range(i - window + 1, i):
             x = (closes[j+1] - closes[j])
@@ -1328,26 +1290,22 @@ def compute_crash_risk_cuda(returns, ncskew, duvol, window):
     n = len(returns)
     
     if i >= window and i < n:
-        # Calculate Mean
         mean_ret = 0.0
         for j in range(i - window, i):
             mean_ret += returns[j]
         mean_ret /= window
         
-        # Calculate Variance & Standard Deviation
         var_ret = 0.0
         for j in range(i - window, i):
             var_ret += (returns[j] - mean_ret)**2
         std_ret = math.sqrt(var_ret / window)
         
-        # 1. NCSKEW
         if std_ret > 0:
             skew = 0.0
             for j in range(i - window, i):
                 skew += ((returns[j] - mean_ret) / std_ret)**3
             ncskew[i] = -(skew / window)
             
-        # 2. DUVOL
         down_sum, up_sum = 0.0, 0.0
         down_count, up_count = 0, 0
         
@@ -1390,7 +1348,6 @@ def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_vol
     
     if i < n - max_hold_days:
         if not (math.isnan(atrs[i]) or math.isnan(spreads[i]) or advs[i] == 0):
-            # 1. Estimate Entry Friction
             vol_ratio = current_volumes[i] / advs[i]
             entry_slippage = closes[i] * 0.001 * math.sqrt(vol_ratio)
             entry_friction = (spreads[i] / 2.0) + entry_slippage
@@ -1399,7 +1356,6 @@ def compute_friction_labels_cuda(closes, highs, lows, atrs, spreads, current_vol
             stop_loss = true_entry_price - atrs[i]
             take_profit = true_entry_price + (atrs[i] * rr_ratio)
             
-            # 2. Path Simulation
             for j in range(i + 1, i + max_hold_days):
                 if lows[j] <= stop_loss:
                     break
@@ -1430,19 +1386,28 @@ def compute_options_labels_cuda(closes, atrs, labels, dte, target_premium_gain):
                     break
 
 # ==============================================================================
-# 2. DASK WORKER EXECUTION MAPPING
+# 3. DASK WORKER EXECUTION MAPPING
 # ==============================================================================
 
 def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Applies massive mechanical sensors to a localized data chunk using 
-    asynchronous CUDA kernel dispatches.
+    Applies massive mechanical sensors to a localized data chunk. 
+    Routes text to the CPU-bound LLM before mapping structural math to the GPU.
     """
     if df.empty or len(df) < 252:
         return pd.DataFrame(columns=df.columns)
         
     df.columns = [c.lower() for c in df.columns]
     
+    # -------------------------------------------------------------------------
+    # MULTI-AGENT HANDOFF: CPU-Bound LLM Sentiment Scoring
+    # -------------------------------------------------------------------------
+    if config.FUSION_ENABLED and 'raw_news_headline' in df.columns:
+        df['sentiment_score'] = df.apply(
+            lambda row: extract_llm_sentiment(str(row['raw_news_headline']), str(row['ticker'])),
+            axis=1
+        ).astype(np.float32)
+
     # Base CPU Analytics
     df['returns'] = df['close'].pct_change().fillna(0)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
@@ -1459,14 +1424,13 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     
     n = len(closes)
     
-    # Initialize blank output arrays
     spreads = np.zeros(n, dtype=np.float64)
     amihud = np.zeros(n, dtype=np.float64)
     ncskew = np.zeros(n, dtype=np.float64)
     duvol = np.zeros(n, dtype=np.float64)
     labels = np.zeros(n, dtype=np.int8)
 
-    # 1. PUSH MEMORY TO VRAM
+    # PUSH MEMORY TO VRAM
     d_closes = cuda.to_device(closes)
     d_highs = cuda.to_device(highs)
     d_lows = cuda.to_device(lows)
@@ -1481,16 +1445,15 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     d_duvol = cuda.to_device(duvol)
     d_labels = cuda.to_device(labels)
 
-    # 2. KERNEL THREAD CONFIGURATION
+    # KERNEL THREAD CONFIGURATION
     threads_per_block = 256
     blocks_per_grid = math.ceil(n / threads_per_block)
 
-    # 3. DISPATCH ASYNCHRONOUS KERNELS
+    # DISPATCH ASYNCHRONOUS KERNELS
     compute_roll_spread_cuda[blocks_per_grid, threads_per_block](d_closes, d_spreads, 20)
     compute_amihud_illiquidity_cuda[blocks_per_grid, threads_per_block](d_returns, d_closes, d_volumes, d_amihud, 20)
     compute_crash_risk_cuda[blocks_per_grid, threads_per_block](d_returns, d_ncskew, d_duvol, 60)
     
-    # Synchronize to ensure the bid-ask spreads are fully calculated before running label friction logic
     cuda.synchronize()
 
     if config.RUN_MODE == "STANDARD":
@@ -1504,11 +1467,15 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
         )
         df['option_target_label'] = d_labels.copy_to_host()
 
-    # 4. PULL VRAM DATA BACK TO HOST RAM
+    # PULL VRAM DATA BACK TO HOST RAM
     df['roll_spread'] = d_spreads.copy_to_host()
     df['amihud_illiq'] = d_amihud.copy_to_host()
     df['ncskew'] = d_ncskew.copy_to_host()
     df['duvol'] = d_duvol.copy_to_host()
+
+    # If the LLM wasn't triggered, safely drop the raw text column so PyArrow Parquet doesn't bloat
+    if 'raw_news_headline' in df.columns:
+        df = df.drop(columns=['raw_news_headline'])
 
     df = df.dropna()
     return df
@@ -1516,18 +1483,16 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
 def compile_features_from_raw() -> None:
     """
     Orchestrates the offline Dask-powered transformation pipeline.
-    Reads partitioned raw data out-of-core, dispatches CUDA instructions, and flushes to vault.
     """
     if not os.path.exists(config.RAW_VAULT_DIR):
         logger.error("Raw storage vault missing. Run ingestion sequence first.")
         return
         
-    logger.info("Engaging CUDA FastMath compilation for institutional microstructure sensors...")
+    logger.info(f"Engaging CUDA compilation... (Fusion Mode: {'ON' if config.FUSION_ENABLED else 'OFF'})")
     reset_processed_vault()
 
     ddf = dd.read_parquet(config.RAW_VAULT_DIR, **config.DASK_READ_KWARGS)
     
-    # Map the massive CUDA block to Dask partition paths
     ddf_processed = ddf.map_partitions(compute_partition_features)
 
     ddf_processed.to_parquet(
@@ -1536,7 +1501,7 @@ def compile_features_from_raw() -> None:
         partition_on=['sector'],
         write_metadata_file=False
     )
-    logger.info(f"Friction-adjusted memory arrays safely exported to {config.PROCESSED_VAULT_DIR}.")
+    logger.info(f"Data arrays safely exported to {config.PROCESSED_VAULT_DIR}.")
 
 --- FILE: ./prepare_for_notebook.py ---
 

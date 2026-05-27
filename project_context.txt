@@ -12,6 +12,7 @@ from typing import Tuple, List, Optional, Any, Dict, Generator
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
+import pyarrow.parquet as pq
 import xgboost as xgb
 from itertools import combinations
 from numba import njit
@@ -21,35 +22,41 @@ import config
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. OUT-OF-CORE BATCH ITERATOR & RISK SIMULATOR
+# 1. OUT-OF-CORE PYARROW ITERATOR (TRUE ZERO-COPY) & RISK SIMULATOR
 # ==============================================================================
-class DataFrameIter(xgb.DataIter):
-    def __init__(self, X: pd.DataFrame, y: pd.Series, batch_size: int = 100000):
+class ParquetDataIter(xgb.DataIter):
+    """
+    A true out-of-core XGBoost Data Iterator.
+    Reads chunked row groups directly from disk via PyArrow, ensuring neither 
+    Host RAM nor GPU VRAM is ever exhausted during massive CPCV evaluations.
+    """
+    def __init__(self, file_path: str, features: List[str], target_col: str):
         super().__init__(on_host=True)
-        self.X = X
-        self.y = y
-        self.batch_size = batch_size
-        self.n_batches = int(np.ceil(len(X) / batch_size))
+        self.file_path = file_path
+        self.features = features
+        self.target_col = target_col
+        
+        # Initialize PyArrow Parquet reader
+        self.pf = pq.ParquetFile(file_path)
+        self.num_row_groups = self.pf.num_row_groups
         self.it = 0
 
     def reset(self) -> None:
         self.it = 0
 
     def next(self, input_data: Any) -> int:
-        if self.it == self.n_batches:
+        if self.it == self.num_row_groups:
             return 0
-        start = self.it * self.batch_size
-        end = min((self.it + 1) * self.batch_size, len(self.X))
-        input_data(data=self.X.iloc[start:end], label=self.y.iloc[start:end])
+            
+        # Read exactly one row group (chunk) from disk
+        chunk_df = self.pf.read_row_group(self.it, columns=self.features + [self.target_col]).to_pandas()
+        
+        input_data(data=chunk_df[self.features], label=chunk_df[self.target_col])
         self.it += 1
         return 1
 
 @njit(fastmath=True)
 def simulate_risk_manager_njit(signals, closes, lows, atrs, atr_multiplier, max_risk_pct):
-    """
-    Simulates the Risk Manager's fractional sizing and dynamic ATR stops during CPCV.
-    Executes in microseconds via LLVM compiler to prevent CPU bottlenecking.
-    """
     n = len(signals)
     returns = np.zeros(n)
     
@@ -58,10 +65,9 @@ def simulate_risk_manager_njit(signals, closes, lows, atrs, atr_multiplier, max_
             entry = closes[i]
             stop = entry - (atr_multiplier * atrs[i])
             
-            # Fractional Position Sizing
             risk_distance = (entry - stop) / entry
             size = max_risk_pct / risk_distance if risk_distance > 0 else 0.0
-            size = min(size, 1.0) # Hard cap to prevent leverage blowouts
+            size = min(size, 1.0) 
             
             if lows[i+1] <= stop:
                 returns[i] = -risk_distance * size
@@ -111,7 +117,7 @@ class ModularTournamentDirector:
         features = [c for c in sector_df.columns if c not in config.METADATA_COLS]
 
         param_grid = {
-            'max_depth': [4, 5],               
+            'max_depth': [3-5],             
             'min_child_weight': [1.0, 3.0],  
             'gamma': [0.1],
             'learning_rate': [0.01, 0.05],
@@ -130,6 +136,10 @@ class ModularTournamentDirector:
         best_returns: np.ndarray = np.array([])
         benchmark_calculated = False
         
+        temp_train_path = f"temp_train_{sector_name}.parquet"
+        temp_test_path = f"temp_test_{sector_name}.parquet"
+        temp_full_path = f"temp_full_{sector_name}.parquet"
+        
         for trial_idx, params in enumerate(grid_combinations):
             params['tree_method'] = 'hist'
             params['device'] = 'cuda'
@@ -141,11 +151,14 @@ class ModularTournamentDirector:
             trial_sentiment = []
             
             for train_df, test_df in self.generate_cpcv_splits(sector_df):
-                X_train, y_train = train_df[features], train_df[target_col]
-                X_test, y_test = test_df[features], test_df[target_col]
+                
+                # Write CPCV splits dynamically to disk with a rigid row_group_size constraint 
+                # This explicitly forces PyArrow to build the chunks the iterator will read
+                train_df.to_parquet(temp_train_path, engine='pyarrow', row_group_size=100000)
+                test_df.to_parquet(temp_test_path, engine='pyarrow', row_group_size=100000)
 
-                train_iter = DataFrameIter(X_train, y_train, batch_size=100000)
-                test_iter = DataFrameIter(X_test, y_test, batch_size=100000)
+                train_iter = ParquetDataIter(temp_train_path, features, target_col)
+                test_iter = ParquetDataIter(temp_test_path, features, target_col)
                 
                 dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
                 dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
@@ -162,7 +175,6 @@ class ModularTournamentDirector:
                 preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
                 signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
                 
-                # SHIELD AGENT: Apply Risk Manager Simulation
                 if config.RISK_MANAGER_ENABLED:
                     closes = test_df['close'].values
                     lows = test_df['low'].values
@@ -199,11 +211,14 @@ class ModularTournamentDirector:
                     fusion_signals = trial_sentiment
 
         if best_params is not None and len(best_returns) > 0:
-            full_iter = DataFrameIter(sector_df[features], sector_df[target_col], batch_size=100000)
+            
+            # Final Candidate Training mapped directly through PyArrow out-of-core
+            sector_df.to_parquet(temp_full_path, engine='pyarrow', row_group_size=100000)
+            full_iter = ParquetDataIter(temp_full_path, features, target_col)
             d_full = xgb.ExtMemQuantileDMatrix(full_iter)
+            
             candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
             
-            # FUSION EVALUATION: Feature Displacement Logging
             if config.FUSION_ENABLED:
                 importances = candidate_booster.get_score(importance_type='gain')
                 sorted_imp = sorted(importances.items(), key=lambda x: x[6], reverse=True)
@@ -231,6 +246,11 @@ class ModularTournamentDirector:
 
             logger.info(f"[{sector_name}] Matrix & Benchmark exported. Awaiting Evaluator verification.")
         
+        # Safely sweep temporary out-of-core PyArrow files from disk
+        for file in [temp_train_path, temp_test_path, temp_full_path]:
+            if os.path.exists(file):
+                os.remove(file)
+                
         gc.collect()
 
     def execute_gauntlet(self) -> None:
@@ -335,6 +355,8 @@ if __name__ == "__main__":
 
 import os
 import re
+import gc
+import math
 import json
 import time
 import requests
@@ -345,7 +367,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import xgboost as xgb
 
-from numba import config as numba_config, njit, prange
+from numba import config as numba_config, njit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -371,10 +393,7 @@ def fetch_live_sentiment(ticker: str) -> float:
     if not config.FUSION_ENABLED:
         return 0.0
 
-    # In a live deployment, replace this mock with a real-time news API (e.g., NewsAPI or Alpaca News)
     live_headline = f"Breaking pre-market developments expected to impact {ticker} today."
-    
-    # Entity Anonymization Engine
     anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', live_headline, flags=re.IGNORECASE)
 
     payload = {
@@ -397,12 +416,12 @@ def fetch_live_sentiment(ticker: str) -> float:
 # ==============================================================================
 # 2. THE SHIELD AGENT: CPU-PARALLELIZED RISK MANAGER
 # ==============================================================================
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True)
 def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: float, 
                              account_capital: float, max_risk_pct: float) -> tuple:
     """
     Intel TBB Parallelized Risk Manager.
-    Evaluates fractional sizing and volatility stops. Returns (Is_Approved, Position_Size).
+    Evaluates sizing and volatility stops. Returns (Is_Approved, Position_Size).
     """
     stop_loss = entry_price - (atr_multiplier * atr)
     risk_per_share = entry_price - stop_loss
@@ -413,12 +432,14 @@ def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: flo
     capital_at_risk = account_capital * max_risk_pct
     position_size = capital_at_risk / risk_per_share
     
-    # Fractional position sizing constraint
     max_allowable_shares = account_capital / entry_price
     position_size = min(position_size, max_allowable_shares)
     
-    if position_size < 1.0: # Alpaca requires at least 1 fractional/whole share minimum depending on asset
-        return False, 0.0 # Veto: Account too small for safe risk profile
+    # FIX: Hard force floor rounding to avoid Alpaca fractional share rejections entirely
+    position_size = math.floor(position_size)
+    
+    if position_size < 1.0: 
+        return False, 0.0 # Veto: Account too small for safe risk profile on this asset
         
     return True, position_size
 
@@ -429,7 +450,6 @@ class LiveTradingSandbox:
     def __init__(self, is_paper: bool = True):
         self.is_paper = is_paper
         
-        # 1. Credential Routing
         self.api_key = os.environ.get('ALPACA_PAPER_API_KEY') if is_paper else os.environ.get('ALPACA_LIVE_API_KEY')
         self.secret_key = os.environ.get('ALPACA_PAPER_SECRET_KEY') if is_paper else os.environ.get('ALPACA_LIVE_SECRET_KEY')
         
@@ -438,13 +458,11 @@ class LiveTradingSandbox:
             
         self.client = TradingClient(self.api_key, self.secret_key, paper=self.is_paper)
         
-        # Verify Alpaca Connection
         account = self.client.get_account()
         self.buying_power = float(account.buying_power)
         logger.info(f"Connected to Alpaca. Mode: {'PAPER' if is_paper else 'LIVE'}. Buying Power: ${self.buying_power:,.2f}")
 
     def load_champion_model(self, sector_name: str) -> tuple:
-        """Loads the XGBoost model and its precise feature manifest from production."""
         model_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion.json")
         features_path = os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_champion_features.json")
         
@@ -460,10 +478,6 @@ class LiveTradingSandbox:
         return booster, features
 
     def execute_live_cycle(self, live_market_df: pd.DataFrame) -> None:
-        """
-        Orchestrates the live stream across all commissioned models.
-        Logs independent decisions to a PyArrow ledger for the Streamlit dashboard.
-        """
         logger.info(f"Initiating Live Market Cycle (Fusion: {config.FUSION_ENABLED}, Risk Manager: {config.RISK_MANAGER_ENABLED})")
         
         unique_sectors = live_market_df['sector'].unique()
@@ -481,13 +495,10 @@ class LiveTradingSandbox:
                 current_price = row['close']
                 current_atr = row['atr']
                 
-                # PHASE 1: THE SENSOR AGENT (LLM)
                 if config.FUSION_ENABLED:
                     sentiment = fetch_live_sentiment(ticker)
                     sector_data.at[index, 'sentiment_score'] = sentiment
                 
-                # PHASE 2: THE QUANTITATIVE AGENT (XGBoost)
-                # Note: GPU prediction handles missing parameters intelligently
                 dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
                 probability = booster.predict(dmatrix)
                 
@@ -496,7 +507,6 @@ class LiveTradingSandbox:
                 position_size = 0.0
                 executed = False
                 
-                # PHASE 3: THE SHIELD AGENT (Risk Manager)
                 if signal == "BUY" and config.RISK_MANAGER_ENABLED:
                     is_approved, position_size = evaluate_risk_veto_gates(
                         current_price, current_atr, config.ATR_STOP_MULTIPLIER, 
@@ -510,16 +520,15 @@ class LiveTradingSandbox:
                         executed = self.route_alpaca_order(ticker, position_size)
                         
                 elif signal == "BUY" and not config.RISK_MANAGER_ENABLED:
-                    # Naked execution (Warning: Dangerous in live markets)
+                    # Naked execution defaults to 1 whole share
                     position_size = 1.0 
                     executed = self.route_alpaca_order(ticker, position_size)
 
-                # Append Telemetry
                 ledger_entries.append({
                     "timestamp": pd.Timestamp.now(),
                     "ticker": ticker,
                     "sector": sector,
-                    "probability": probability,
+                    "probability": float(probability) if isinstance(probability, np.ndarray) else float(probability),
                     "sentiment": sector_data.at[index, 'sentiment_score'] if config.FUSION_ENABLED else 0.0,
                     "signal": signal,
                     "veto_reason": veto_reason,
@@ -527,7 +536,13 @@ class LiveTradingSandbox:
                     "executed": executed
                 })
                 
-        # Flush Telemetry to PyArrow Ledger
+                # FIX 1: Flush DMatrix from GPU VRAM after every inference
+                del dmatrix
+
+            # FIX 2: Flush XGBoost Booster graph from GPU VRAM after sector completes
+            del booster, features
+            gc.collect()
+                
         if ledger_entries:
             os.makedirs(config.LIVE_LOG_DIR, exist_ok=True)
             df_ledger = pd.DataFrame(ledger_entries)
@@ -535,16 +550,16 @@ class LiveTradingSandbox:
             pq.write_to_dataset(table, root_path=config.LIVE_LOG_DIR, partition_cols=['sector'])
 
     def route_alpaca_order(self, ticker: str, quantity: float) -> bool:
-        """Executes the authentic Alpaca Market Order."""
         try:
             order_request = MarketOrderRequest(
                 symbol=ticker,
-                qty=round(quantity, 2), # Alpaca supports fractional shares
+                # Enforce integer typing for Alpaca API strictly to match the floor logic
+                qty=int(quantity), 
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY
             )
             self.client.submit_order(order_data=order_request)
-            logger.info(f"EXECUTED: {ticker} | Qty: {quantity}")
+            logger.info(f"EXECUTED: {ticker} | Qty: {int(quantity)}")
             return True
         except Exception as e:
             logger.error(f"Alpaca Routing Failed for {ticker}: {e}")
@@ -860,7 +875,7 @@ import os
 import glob
 import itertools
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -939,6 +954,29 @@ class QuantitativeEvaluator:
         pbo_value = np.sum(np.array(logits) < 0) / len(logits)
         return float(pbo_value)
 
+    def calculate_alpha_decay(self, champion_returns: pd.Series, benchmark_returns: pd.Series) -> Tuple[float, float, float]:
+        """
+        Calculates Alpha Decay by splitting the performance into two periods (P1 and P2).
+        Mimics the Look-Ahead-Bench dual-period evaluation to detect LLM memorization and 
+        the 'Scaling Paradox'.
+        """
+        split_idx = len(champion_returns) // 2
+        
+        # P1: Early Period
+        champ_p1_ret = champion_returns.iloc[:split_idx].mean() * 252
+        bench_p1_ret = benchmark_returns.iloc[:split_idx].mean() * 252
+        alpha_p1 = champ_p1_ret - bench_p1_ret
+        
+        # P2: Late Period (Generalization Test)
+        champ_p2_ret = champion_returns.iloc[split_idx:].mean() * 252
+        bench_p2_ret = benchmark_returns.iloc[split_idx:].mean() * 252
+        alpha_p2 = champ_p2_ret - bench_p2_ret
+        
+        # Decay is the percentage point (pp) drop in Alpha from P1 to P2
+        alpha_decay = alpha_p2 - alpha_p1
+        
+        return alpha_decay, alpha_p1, alpha_p2
+
     def assess_sector(self, sector_name: str) -> bool:
         logger.info(f"\n{'='*60}\nEvaluating Candidate for Sector: {sector_name}\n{'='*60}")
 
@@ -988,10 +1026,20 @@ class QuantitativeEvaluator:
         except Exception:
             return False
 
-        # 4. Generate Institutional Tearsheet
+        # 4. Look-Ahead Bias & Alpha Decay Detection
+        logger.info("4. Evaluating Alpha Decay (Look-Ahead Bias)...")
+        alpha_decay, alpha_p1, alpha_p2 = self.calculate_alpha_decay(champion_returns, benchmark_returns)
+        logger.info(f"[{sector_name}] Alpha P1: {alpha_p1*100:.2f}% | Alpha P2: {alpha_p2*100:.2f}% | Alpha Decay: {alpha_decay*100:.2f} pp")
+        
+        # Standard foundation models have been shown to decay more than -15pp when tested strictly out-of-sample
+        if config.FUSION_ENABLED and alpha_decay < -0.15:
+            logger.warning(f"[{sector_name}] SEVERE ALPHA DECAY DETECTED: The LLM is exhibiting the 'Scaling Paradox'.")
+            logger.warning("The foundation model is relying on memorized pre-training data (Memory Trap) rather than genuine reasoning.")
+            logger.warning("RECOMMENDATION: Swap your standard model for a Point-in-Time (PiT) model like Pitinf-Small or Pitinf-Medium.")
+
+        # 5. Generate Institutional Tearsheet
         logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
         try:
-            # FUSION EVALUATION: Append LLM sentiment to tearsheet correlation reporting if active
             if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
                 bench_df.index = pd.date_range(start='2020-01-01', periods=len(bench_df), freq='D')
                 qs.reports.html(

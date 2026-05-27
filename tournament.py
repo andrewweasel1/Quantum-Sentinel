@@ -23,10 +23,11 @@ logger = logging.getLogger(__name__)
 class ParquetDataIter(xgb.DataIter):
     """
     A true out-of-core XGBoost Data Iterator.
-    Reads chunked row groups directly from disk via PyArrow, ensuring neither 
+    Reads chunked row groups directly from disk via PyArrow Tables, ensuring neither 
     Host RAM nor GPU VRAM is ever exhausted during massive CPCV evaluations.
     """
     def __init__(self, file_path: str, features: List[str], target_col: str):
+        # Instantiate on_host=True so DMatrix loads pointers into GPU batches
         super().__init__(on_host=True)
         self.file_path = file_path
         self.features = features
@@ -44,10 +45,16 @@ class ParquetDataIter(xgb.DataIter):
         if self.it == self.num_row_groups:
             return 0
             
-        # Read exactly one row group (chunk) from disk
-        chunk_df = self.pf.read_row_group(self.it, columns=self.features + [self.target_col]).to_pandas()
+        # FIX: Read exactly one row group from disk as a native PyArrow Table.
+        # We REMOVED .to_pandas() to prevent memory duplication and deserialization.
+        chunk_table = self.pf.read_row_group(self.it, columns=self.features + [self.target_col])
         
-        input_data(data=chunk_df[self.features], label=chunk_df[self.target_col])
+        # Isolate features and target natively using Arrow's zero-copy .select()
+        X_chunk = chunk_table.select(self.features)
+        y_chunk = chunk_table.select([self.target_col])
+        
+        # Pass the raw Arrow Tables directly into the XGBoost CUDA allocator
+        input_data(data=X_chunk, label=y_chunk)
         self.it += 1
         return 1
 
@@ -92,7 +99,8 @@ class ModularTournamentDirector:
             test_df = df.loc[test_indices]
             train_df = df.drop(index=test_indices)
             
-            embargo_gap = config.MAX_HOLD_DAYS 
+            # FIX: Convert integer to Timedelta and isolate scalars
+            embargo_gap = pd.Timedelta(days=config.MAX_HOLD_DAYS) 
             for test_idx in test_combo:
                 boundary_start = indices[test_idx] - embargo_gap
                 boundary_end = indices[test_idx][-1] + embargo_gap

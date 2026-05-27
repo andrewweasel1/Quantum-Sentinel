@@ -145,7 +145,10 @@ class LiveTradingSandbox:
                     sector_data.at[index, 'sentiment_score'] = sentiment
                 
                 dmatrix = xgb.DMatrix(sector_data.loc[[index]][features])
-                probability = booster.predict(dmatrix)
+                probability_array = booster.predict(dmatrix)
+                
+                # FIX: Extract scalar value from the XGBoost prediction array
+                probability = probability_array.item() if isinstance(probability_array, np.ndarray) else probability_array
                 
                 signal = "BUY" if probability > config.CONFIDENCE_THRESHOLD else "HOLD"
                 veto_reason = "N/A"

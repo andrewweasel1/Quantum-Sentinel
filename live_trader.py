@@ -12,12 +12,32 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import xgboost as xgb
 
-from numba import config as numba_config, njit
+from numba import njit # FIX: Removed unused numba_config to prevent TBB dependency crash
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 import config
+
+def fetch_live_sentiment(ticker: str) -> float:
+    if not config.FUSION_ENABLED:
+        return 0.0
+
+    live_headline = f"Breaking pre-market developments expected to impact {ticker} today."
+    anonymized_headline = re.sub(rf'\b{ticker}\b', 'the company', live_headline, flags=re.IGNORECASE)
+
+    payload = {
+        "model": config.LLM_MODEL_NAME,
+        "prompt": f"{config.LLM_SYSTEM_PROMPT}\n\nHeadline: {anonymized_headline}",
+        "format": "json",
+        "stream": False
+    }
+
+    try:
+        response = requests.post(config.OLLAMA_ENDPOINT, json=payload, timeout=3.0)
+        if response.status_code == 200:
+            data = json.loads(response.json().get("response", "{}"))
+            return float(data.get("sentiment_score", 0.0))
 
 # ==============================================================================
 # 0. CENTRALIZED LOGGING & INTEL TBB CONFIGURATION

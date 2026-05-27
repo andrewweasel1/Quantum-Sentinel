@@ -28,6 +28,7 @@ requests
 alpaca-py
 aiohttp
 asyncio
+nest_asyncio
 
 # Telemetry & Dashboard Interface
 streamlit

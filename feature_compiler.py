@@ -5,6 +5,7 @@ import json
 import shutil
 import asyncio
 import aiohttp
+import nest_asyncio
 import logging
 import numpy as np
 import pandas as pd
@@ -13,6 +14,9 @@ import pandas_ta as ta
 from numba import cuda
 
 import config
+
+# FIX: Allow asyncio.run() to operate securely inside Dask's existing worker event loops
+nest_asyncio.apply()
 
 logger = logging.getLogger(__name__)
 

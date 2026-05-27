@@ -158,106 +158,112 @@ class ModularTournamentDirector:
             trial_oos_returns = []
             trial_sentiment = []
             
-            for train_df, test_df in self.generate_cpcv_splits(sector_df):
+            try:
+                for train_df, test_df in self.generate_cpcv_splits(sector_df):
                 
-                # Write CPCV splits dynamically to disk with a rigid row_group_size constraint 
-                # This explicitly forces PyArrow to build the chunks the iterator will read
-                train_df.to_parquet(temp_train_path, engine='pyarrow', row_group_size=100000)
-                test_df.to_parquet(temp_test_path, engine='pyarrow', row_group_size=100000)
+                    # Write CPCV splits dynamically to disk with a rigid row_group_size constraint 
+                 # This explicitly forces PyArrow to build the chunks the iterator will read
+                 train_df.to_parquet(temp_train_path, engine='pyarrow', row_group_size=100000)
+                    test_df.to_parquet(temp_test_path, engine='pyarrow', row_group_size=100000)
 
-                train_iter = ParquetDataIter(temp_train_path, features, target_col)
-                test_iter = ParquetDataIter(temp_test_path, features, target_col)
+                    train_iter = ParquetDataIter(temp_train_path, features, target_col)
+                    test_iter = ParquetDataIter(temp_test_path, features, target_col)
                 
-                dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
-                dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
+                    dtrain = xgb.ExtMemQuantileDMatrix(train_iter)
+                    dtest = xgb.ExtMemQuantileDMatrix(test_iter, ref=dtrain)
                 
-                bst = xgb.train(
-                    params,
-                    dtrain,
-                    num_boost_round=500,
-                    evals=[(dtrain, 'train'), (dtest, 'eval')],
-                    early_stopping_rounds=25,
-                    verbose_eval=False
-                )
-                
-                preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
-                signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
-                
-                if config.RISK_MANAGER_ENABLED:
-                    closes = test_df['close'].values
-                    lows = test_df['low'].values
-                    atrs = test_df['atr'].values
-                    strategy_returns = simulate_risk_manager_njit(
-                        signals, closes, lows, atrs, config.ATR_STOP_MULTIPLIER, config.MAX_RISK_PER_TRADE
+                    bst = xgb.train(
+                        params,
+                        dtrain,
+                        num_boost_round=500,
+                        evals=[(dtrain, 'train'), (dtest, 'eval')],
+                        early_stopping_rounds=25,
+                        verbose_eval=False
                     )
-                else:
-                    forward_returns = test_df['close'].pct_change().fillna(0).values
-                    strategy_returns = signals * forward_returns
+                
+                    preds_proba = bst.predict(dtest, iteration_range=(0, bst.best_iteration + 1))
+                    signals = (preds_proba > config.CONFIDENCE_THRESHOLD).astype(int)
                     
-                trial_oos_returns.extend(strategy_returns)
+                    if config.RISK_MANAGER_ENABLED:
+                        closes = test_df['close'].values
+                        lows = test_df['low'].values
+                        atrs = test_df['atr'].values
+                        strategy_returns = simulate_risk_manager_njit(
+                            signals, closes, lows, atrs, config.ATR_STOP_MULTIPLIER, config.MAX_RISK_PER_TRADE
+                        )
+                    else:
+                        forward_returns = test_df['close'].pct_change().fillna(0).values
+                        strategy_returns = signals * forward_returns
+                        
+                    trial_oos_returns.extend(strategy_returns)
 
+                    if config.FUSION_ENABLED:
+                        trial_sentiment.extend(test_df['sentiment_score'].values)
+
+                    if not benchmark_calculated:
+                        benchmark_returns.extend(test_df['close'].pct_change().fillna(0).values)
+
+                    del dtrain, dtest, train_iter, test_iter
+                    
+                benchmark_calculated = True
+                trial_oos_returns = np.array(trial_oos_returns)
+                
+                returns_matrix[f"trial_{trial_idx}"] = trial_oos_returns
+                
+                trial_sr = np.mean(trial_oos_returns) / np.std(trial_oos_returns) if np.std(trial_oos_returns) > 0 else 0.0
+                    
+                if trial_sr > best_sr:
+                    best_sr = trial_sr
+                    best_params = params
+                    best_returns = trial_oos_returns
+                    if config.FUSION_ENABLED:
+                        fusion_signals = trial_sentiment
+
+            if best_params is not None and len(best_returns) > 0:
+                
+                # Final Candidate Training mapped directly through PyArrow out-of-core
+                sector_df.to_parquet(temp_full_path, engine='pyarrow', row_group_size=100000)
+                full_iter = ParquetDataIter(temp_full_path, features, target_col)
+                d_full = xgb.ExtMemQuantileDMatrix(full_iter)
+                
+                candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
+                
                 if config.FUSION_ENABLED:
-                    trial_sentiment.extend(test_df['sentiment_score'].values)
+                    importances = candidate_booster.get_score(importance_type='gain')
+                    sorted_imp = sorted(importances.items(), key=lambda x: x[6], reverse=True)
+                    top_features = [x for x in sorted_imp[:5]]
+                    if 'sentiment_score' in top_features:
+                        logger.info(f"[{sector_name}] FUSION SUCCESS: LLM Sentiment generated alpha (Top 5 Feature).")
+                    else:
+                        logger.warning(f"[{sector_name}] FUSION DECAY: LLM Sentiment was displaced by technicals. Acting as noise.")
 
-                if not benchmark_calculated:
-                    benchmark_returns.extend(test_df['close'].pct_change().fillna(0).values)
-
-                del dtrain, dtest, train_iter, test_iter
+                os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
+                candidate_booster.save_model(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"))
                 
-            benchmark_calculated = True
-            trial_oos_returns = np.array(trial_oos_returns)
-            
-            returns_matrix[f"trial_{trial_idx}"] = trial_oos_returns
-            
-            trial_sr = np.mean(trial_oos_returns) / np.std(trial_oos_returns) if np.std(trial_oos_returns) > 0 else 0.0
+                with open(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json"), "w") as f:
+                    json.dump(features, f)
                 
-            if trial_sr > best_sr:
-                best_sr = trial_sr
-                best_params = params
-                best_returns = trial_oos_returns
+                matrix_df = pd.DataFrame(returns_matrix)
+                matrix_df.to_parquet(f"returns_matrix_{sector_name}.parquet", engine='pyarrow')
+                
+                bench_dict = {"benchmark": benchmark_returns, "champion": best_returns}
                 if config.FUSION_ENABLED:
-                    fusion_signals = trial_sentiment
+                    bench_dict["sentiment_score"] = fusion_signals
+                    
+                bench_df = pd.DataFrame(bench_dict)
+                bench_df.to_parquet(f"benchmark_{sector_name}.parquet", engine='pyarrow')
 
-        if best_params is not None and len(best_returns) > 0:
-            
-            # Final Candidate Training mapped directly through PyArrow out-of-core
-            sector_df.to_parquet(temp_full_path, engine='pyarrow', row_group_size=100000)
-            full_iter = ParquetDataIter(temp_full_path, features, target_col)
-            d_full = xgb.ExtMemQuantileDMatrix(full_iter)
-            
-            candidate_booster = xgb.train(best_params, d_full, num_boost_round=100)
-            
-            if config.FUSION_ENABLED:
-                importances = candidate_booster.get_score(importance_type='gain')
-                sorted_imp = sorted(importances.items(), key=lambda x: x[6], reverse=True)
-                top_features = [x for x in sorted_imp[:5]]
-                if 'sentiment_score' in top_features:
-                    logger.info(f"[{sector_name}] FUSION SUCCESS: LLM Sentiment generated alpha (Top 5 Feature).")
-                else:
-                    logger.warning(f"[{sector_name}] FUSION DECAY: LLM Sentiment was displaced by technicals. Acting as noise.")
-
-            os.makedirs(config.PROD_MODELS_DIR, exist_ok=True)
-            candidate_booster.save_model(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate.json"))
-            
-            with open(os.path.join(config.PROD_MODELS_DIR, f"{sector_name}_candidate_features.json"), "w") as f:
-                json.dump(features, f)
-            
-            matrix_df = pd.DataFrame(returns_matrix)
-            matrix_df.to_parquet(f"returns_matrix_{sector_name}.parquet", engine='pyarrow')
-            
-            bench_dict = {"benchmark": benchmark_returns, "champion": best_returns}
-            if config.FUSION_ENABLED:
-                bench_dict["sentiment_score"] = fusion_signals
-                
-            bench_df = pd.DataFrame(bench_dict)
-            bench_df.to_parquet(f"benchmark_{sector_name}.parquet", engine='pyarrow')
-
-            logger.info(f"[{sector_name}] Matrix & Benchmark exported. Awaiting Evaluator verification.")
+                logger.info(f"[{sector_name}] Matrix & Benchmark exported. Awaiting Evaluator verification.")
         
-        # Safely sweep temporary out-of-core PyArrow files from disk
-        for file in [temp_train_path, temp_test_path, temp_full_path]:
-            if os.path.exists(file):
-                os.remove(file)
+        finally:
+            # FIX: Deterministic disk sweeping regardless of ML execution exceptions
+            # Safely sweep temporary out-of-core PyArrow files from disk
+            for file in [temp_train_path, temp_test_path, temp_full_path]:
+                    if os.path.exists(file):
+                        try:
+                            os.remove(file)
+                        except OSError:
+                            pass
                 
         gc.collect()
 
@@ -469,7 +475,7 @@ def evaluate_risk_veto_gates(entry_price: float, atr: float, atr_multiplier: flo
     if position_size < 1.0: 
         return False, 0.0 # Veto: Account too small for safe risk profile on this asset
         
-    return True, position_size
+    return True, float(position_size)
 
 # ==============================================================================
 # 3. LIVE SANDBOX EXECUTION CYCLE
@@ -1215,7 +1221,7 @@ async def process_llm_batch_async(df: pd.DataFrame) -> list:
     semaphore = asyncio.Semaphore(20)
     
     # TCPConnector limits the total active connections pooling
-    connector = aiohttp.TCPConnector(limit=20)
+    connector = aiohttp.TCPConnector(limit=20, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
             fetch_sentiment_async(semaphore, session, str(row['raw_news_headline']), str(row['ticker']))
@@ -1256,7 +1262,8 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['adv_20'] = df['volume'].rolling(window=20).mean()
     
-    # ... [Keep the rest of the array memory staging and GPU push identical] ...
+   # FIX: Purge NaNs prior to VRAM transfer to prevent IEEE-754 CUDA array poisoning
+    df = df.dropna()
     
     # Stage continuous NumPy arrays for GPU transfer
     # FIX: Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
@@ -1323,7 +1330,6 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     if 'raw_news_headline' in df.columns:
         df = df.drop(columns=['raw_news_headline'])
 
-    df = df.dropna()
     return df
 
 def compile_features_from_raw() -> None:

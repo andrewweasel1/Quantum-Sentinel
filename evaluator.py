@@ -167,11 +167,16 @@ class QuantitativeEvaluator:
         # 5. Generate Institutional Tearsheet
         logger.info(f"[{sector_name}] TRUE ALPHA DETECTED. Promoting to production.")
         try:
+            # FIX: Dynamically anchor the DatetimeIndex to the config window and use Business Days ('B').
+            # This ensures QuantStats applies the correct 252-day annualization math for Sharpe/Sortino ratios.
+            dummy_index = pd.bdate_range(end=config.END_DATE, periods=len(champion_returns))
+            champion_returns.index = dummy_index
+            benchmark_returns.index = dummy_index
+
             if config.FUSION_ENABLED and 'sentiment_score' in bench_df.columns:
-                bench_df.index = pd.date_range(start='2020-01-01', periods=len(bench_df), freq='D')
                 qs.reports.html(
-                    returns=bench_df['champion'], 
-                    benchmark=bench_df['benchmark'], 
+                    returns=champion_returns, 
+                    benchmark=benchmark_returns, 
                     title=f'Quantum Sentinel - {sector_name} Champion Profile (LLM FUSION)', 
                     output=f"tearsheet_{sector_name}.html"
                 )

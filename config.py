@@ -75,7 +75,7 @@ PARQUET_BLOCKSIZE = "256MiB"
 DASK_READ_KWARGS = {
     "engine": "pyarrow",
     "blocksize": PARQUET_BLOCKSIZE,
-    "split_row_groups": "adaptive",
+    "split_row_groups": "infer",
     "dtype_backend": "pyarrow"  
 }
 

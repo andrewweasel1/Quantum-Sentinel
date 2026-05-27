@@ -103,13 +103,14 @@ def compute_partition_features(df: pd.DataFrame) -> pd.DataFrame:
     # ... [Keep the rest of the array memory staging and GPU push identical] ...
     
     # Stage continuous NumPy arrays for GPU transfer
-    closes = np.ascontiguousarray(df['close'].values.astype(np.float64))
-    highs = np.ascontiguousarray(df['high'].values.astype(np.float64))
-    lows = np.ascontiguousarray(df['low'].values.astype(np.float64))
-    volumes = np.ascontiguousarray(df['volume'].values.astype(np.float64))
-    returns = np.ascontiguousarray(df['returns'].values.astype(np.float64))
-    atrs = np.ascontiguousarray(df['atr'].fillna(0).values.astype(np.float64))
-    advs = np.ascontiguousarray(df['adv_20'].fillna(0).values.astype(np.float64))
+    # FIX: Safely serialize PyArrow Extension Arrays into strict contiguous C-arrays for Numba VRAM 
+    closes = np.ascontiguousarray(df['close'].to_numpy(dtype=np.float64, na_value=np.nan))
+    highs = np.ascontiguousarray(df['high'].to_numpy(dtype=np.float64, na_value=np.nan))
+    lows = np.ascontiguousarray(df['low'].to_numpy(dtype=np.float64, na_value=np.nan))
+    volumes = np.ascontiguousarray(df['volume'].to_numpy(dtype=np.float64, na_value=np.nan))
+    returns = np.ascontiguousarray(df['returns'].to_numpy(dtype=np.float64, na_value=np.nan))
+    atrs = np.ascontiguousarray(df['atr'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
+    advs = np.ascontiguousarray(df['adv_20'].fillna(0).to_numpy(dtype=np.float64, na_value=np.nan))
     
     n = len(closes)
     
